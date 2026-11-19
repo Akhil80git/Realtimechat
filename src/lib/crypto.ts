@@ -13,7 +13,51 @@ const RANDOM_NAME_BASES = [
   'Meera',
   'Sana',
   'Vihaan',
+  'Ananya',
+  'Rohan',
+  'Isha',
+  'Arjun',
+  'Diya',
+  'Nikhil',
+  'Kavya',
+  'Samir',
 ];
+
+export interface UsernameConflict {
+  source: 'online' | 'contact';
+  existingName: string;
+  peerId: string;
+}
+
+export function findUsernameConflict(
+  candidate: string,
+  localPeerId: string,
+  onlinePeers: Array<{ peerId: string; name: string }>,
+  savedContacts: Array<{ peerId: string; name: string }>,
+): UsernameConflict | null {
+  const norm = candidate.trim().toLowerCase();
+  if (!norm) return null;
+
+  const onlineIds = new Set<string>();
+  for (const p of onlinePeers) {
+    onlineIds.add(p.peerId);
+    if (p.peerId !== localPeerId && p.name.trim().toLowerCase() === norm) {
+      return { source: 'online', existingName: p.name, peerId: p.peerId };
+    }
+  }
+
+  for (const c of savedContacts) {
+    if (
+      c.peerId !== localPeerId &&
+      !onlineIds.has(c.peerId) &&
+      c.name.trim().toLowerCase() === norm
+    ) {
+      return { source: 'contact', existingName: c.name, peerId: c.peerId };
+    }
+  }
+
+  return null;
+}
 
 export function generatePeerId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -25,7 +69,7 @@ export function generatePeerId(): string {
 export function generateRandomUsername(): string {
   const base =
     RANDOM_NAME_BASES[Math.floor(Math.random() * RANDOM_NAME_BASES.length)];
-  const suffix = Math.floor(10 + Math.random() * 89).toString();
+  const suffix = Math.floor(100 + Math.random() * 899).toString();
   return `${base}${suffix}`;
 }
 
@@ -37,10 +81,19 @@ export function generateQrDerivedUsername(fromName: string): string {
   const base = cleaned || 'Friend';
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
   let suffix = '';
-  for (let i = 0; i < 2; i++) {
+  for (let i = 0; i < 3; i++) {
     suffix += chars[Math.floor(Math.random() * chars.length)];
   }
   return `${base}${suffix}`;
+}
+
+export function makeUniqueSuffix(baseName: string): string {
+  const cleaned = baseName.trim().slice(0, 26);
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const suffix =
+    chars[Math.floor(Math.random() * chars.length)] +
+    chars[Math.floor(Math.random() * chars.length)];
+  return `${cleaned}_${suffix}`;
 }
 
 export function getDmChannelId(peerA: string, peerB: string): string {

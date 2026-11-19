@@ -55,7 +55,13 @@ export function saveProfile(profile: UserProfile): void {
 
 export function loadAllMessages(): ChatMessage[] {
   const msgs = safeParse<ChatMessage[]>(localStorage.getItem(MSG_KEY), []);
-  return msgs.sort((a, b) => a.timestamp - b.timestamp);
+  return msgs
+    .map((m) =>
+      m.transferProgress !== undefined
+        ? { ...m, transferProgress: undefined }
+        : m,
+    )
+    .sort((a, b) => a.timestamp - b.timestamp);
 }
 
 export function saveAllMessages(messages: ChatMessage[]): void {
@@ -128,12 +134,12 @@ export function enqueueOutboxItem(item: OutboxItem): void {
   let list = loadOutbox();
 
   if (item.kind === 'delete-msg' && item.messageId) {
-    // Cancel any unsent chat or reaction for the deleted message for this target
+    // Cancel any unsent chat for the deleted message for this target
     list = list.filter(
       (o) =>
         !(
           o.targetPeerId === item.targetPeerId &&
-          (o.kind === 'chat' || o.kind === 'reaction') &&
+          o.kind === 'chat' &&
           (o.message?.id === item.messageId || o.messageId === item.messageId)
         ),
     );

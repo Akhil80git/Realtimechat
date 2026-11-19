@@ -4,10 +4,12 @@ import { ChatArea } from './components/ChatArea';
 import { QrModal } from './components/QrModal';
 import { Sidebar } from './components/Sidebar';
 import {
+  findUsernameConflict,
   generatePeerId,
   generateQrDerivedUsername,
   generateRandomUsername,
   getDmChannelId,
+  makeUniqueSuffix,
 } from './lib/crypto';
 import { prepareMediaAttachment } from './lib/media';
 import { P2PChatEngine } from './lib/p2pEngine';
@@ -27,7 +29,6 @@ import {
   ChatAttachment,
   ChatMessage,
   PeerInfo,
-  ReplyRef,
   StorageStats,
   StoredContact,
   UserProfile,
@@ -64,36 +65,6 @@ function saveSessionProfileOverride(profile: UserProfile): void {
   }
 }
 
-function applyReactionUpdate(
-  list: ChatMessage[],
-  messageId: string,
-  emoji: string,
-  peerId: string,
-  add: boolean,
-): ChatMessage[] {
-  let changed = false;
-  const next = list.map((m) => {
-    if (m.id !== messageId) return m;
-    const current = { ...(m.reactions ?? {}) };
-    const users = new Set(current[emoji] ?? []);
-    if (add) {
-      if (users.has(peerId)) return m;
-      users.add(peerId);
-    } else {
-      if (!users.has(peerId)) return m;
-      users.delete(peerId);
-    }
-    changed = true;
-    if (users.size === 0) {
-      delete current[emoji];
-    } else {
-      current[emoji] = Array.from(users);
-    }
-    return { ...m, reactions: current };
-  });
-  return changed ? next : list;
-}
-
 function resolveBootState(boot: UrlBootParams): {
   profile: UserProfile;
   initialChannelId: string;
@@ -111,16 +82,23 @@ function resolveBootState(boot: UrlBootParams): {
 
   // Instant auto-account creation on first visit (or via QR scan)
   if (!profile) {
-    const autoName =
+    const newPeerId = generatePeerId();
+    const existingContacts = loadContacts();
+    let autoName =
       boot.connectPeerId && boot.connectFromName
         ? generateQrDerivedUsername(boot.connectFromName)
         : generateRandomUsername();
 
+    while (findUsernameConflict(autoName, newPeerId, [], existingContacts)) {
+      autoName = makeUniqueSuffix(autoName);
+    }
+
     profile = {
-      peerId: generatePeerId(),
+      peerId: newPeerId,
       name: autoName,
       theme: preferredTheme,
       createdAt: Date.now(),
+      customName: false,
     };
 
     if (boot.isNewTab) {
@@ -173,6 +151,9 @@ export default function App() {
   const messagesRef = useRef<ChatMessage[]>(messages);
   messagesRef.current = messages;
 
+  const profileRef = useRef<UserProfile>(profile);
+  profileRef.current = profile;
+
   const activeChannelRef = useRef<string>(activeChannelId);
   activeChannelRef.current = activeChannelId;
 
@@ -224,119 +205,6 @@ export default function App() {
     });
   }, []);
 
-  useEffect(() => {
-    const currentMsgs = loadAllMessages();
-    setMessages(currentMsgs);
-    refreshStats();
-
-    const engine = new P2PChatEngine(profile.peerId, profile.name, {
-      onPeersChange: (peers) => {
-        setOnlinePeers(peers);
-        for (const p of peers) {
-          setSavedContacts(upsertContact(p.peerId, p.name, p.lastSeen));
-        }
-      },
-      onMessageReceived: (incoming) => {
-        setMessages((prev) => {
-          if (prev.some((m) => m.id === incoming.id)) return prev;
-          const next = [...prev, incoming].sort((a, b) => a.timestamp - b.timestamp);
-          saveAllMessages(next);
-          return next;
-        });
-
-        const preview =
-          incoming.text.slice(0, 48) ||
-          (incoming.attachment
-            ? `[${incoming.attachment.kind}] ${incoming.attachment.name}`
-            : '');
-
-        setSavedContacts(
-          upsertContact(
-            incoming.senderId,
-            incoming.senderName,
-            incoming.timestamp,
-            preview,
-            incoming.timestamp,
-          ),
-        );
-
-        if (activeChannelRef.current !== incoming.channelId) {
-          setUnreadByChannel((prev) => ({
-            ...prev,
-            [incoming.channelId]: (prev[incoming.channelId] ?? 0) + 1,
-          }));
-        }
-
-        refreshStats();
-      },
-      onMediaTransferProgress: (messageId, progress) => {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === messageId ? { ...m, transferProgress: progress } : m,
-          ),
-        );
-        if (progress === undefined) {
-          refreshStats();
-        }
-      },
-      onMessageAcked: (messageId) => {
-        setMessages((prev) => {
-          let changed = false;
-          const next = prev.map((m) => {
-            if (m.id === messageId && m.status !== 'delivered') {
-              changed = true;
-              return { ...m, status: 'delivered' as const };
-            }
-            return m;
-          });
-          if (changed) {
-            saveAllMessages(next);
-          }
-          return changed ? next : prev;
-        });
-      },
-      onReactionReceived: (_channelId, messageId, emoji, peerId, add) => {
-        setMessages((prev) => {
-          const next = applyReactionUpdate(prev, messageId, emoji, peerId, add);
-          if (next !== prev) {
-            saveAllMessages(next);
-          }
-          return next;
-        });
-      },
-      onMessageDeleted: (_channelId, messageId) => {
-        void deleteSingleMessage(messageId).then((remaining) => {
-          setMessages(remaining);
-          refreshStats();
-        });
-      },
-      onChannelCleared: (channelId, clearedAt) => {
-        void clearChannelMessages(channelId, clearedAt).then((remaining) => {
-          setMessages(remaining);
-          refreshStats();
-        });
-      },
-      onConnectionStatusChange: (connected, label) => {
-        setMeshConnected(connected);
-        setMeshLabel(label);
-      },
-    });
-
-    engineRef.current = engine;
-    void engine.start(currentMsgs);
-
-    return () => {
-      engine.stop();
-      engineRef.current = null;
-    };
-  }, [profile.peerId, refreshStats]);
-
-  useEffect(() => {
-    if (engineRef.current) {
-      engineRef.current.updateLocalName(profile.name);
-    }
-  }, [profile.name]);
-
   const persistProfile = useCallback(
     (updated: UserProfile) => {
       setProfile(updated);
@@ -349,6 +217,144 @@ export default function App() {
     [bootParams.isNewTab],
   );
 
+  useEffect(() => {
+    const currentMsgs = loadAllMessages();
+    setMessages(currentMsgs);
+    refreshStats();
+
+    const engine = new P2PChatEngine(
+      profile.peerId,
+      profile.name,
+      {
+        onPeersChange: (peers) => {
+          setOnlinePeers(peers);
+          for (const p of peers) {
+            setSavedContacts(upsertContact(p.peerId, p.name, p.lastSeen));
+          }
+
+          // Auto-resolve rare duplicate if this account still has an auto-generated name
+          const currentProfile = profileRef.current;
+          if (!currentProfile.customName) {
+            const norm = currentProfile.name.trim().toLowerCase();
+            const duplicateOwner = peers.find(
+              (p) =>
+                p.peerId !== currentProfile.peerId &&
+                p.name.trim().toLowerCase() === norm &&
+                ((p.createdAt ?? 0) < currentProfile.createdAt ||
+                  ((p.createdAt ?? 0) === currentProfile.createdAt &&
+                    p.peerId < currentProfile.peerId)),
+            );
+            if (duplicateOwner) {
+              let resolved = makeUniqueSuffix(currentProfile.name);
+              while (
+                peers.some(
+                  (p) => p.name.trim().toLowerCase() === resolved.toLowerCase(),
+                )
+              ) {
+                resolved = makeUniqueSuffix(currentProfile.name);
+              }
+              persistProfile({ ...currentProfile, name: resolved });
+            }
+          }
+        },
+        onMessageReceived: (incoming) => {
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === incoming.id)) return prev;
+            const next = [...prev, incoming].sort((a, b) => a.timestamp - b.timestamp);
+            saveAllMessages(next);
+            return next;
+          });
+
+          const preview =
+            incoming.text.slice(0, 48) ||
+            (incoming.attachment
+              ? `[${incoming.attachment.kind}] ${incoming.attachment.name}`
+              : '');
+
+          setSavedContacts(
+            upsertContact(
+              incoming.senderId,
+              incoming.senderName,
+              incoming.timestamp,
+              preview,
+              incoming.timestamp,
+            ),
+          );
+
+          if (activeChannelRef.current !== incoming.channelId) {
+            setUnreadByChannel((prev) => ({
+              ...prev,
+              [incoming.channelId]: (prev[incoming.channelId] ?? 0) + 1,
+            }));
+          }
+
+          refreshStats();
+        },
+        onMediaTransferProgress: (messageId, progress) => {
+          setMessages((prev) => {
+            const next = prev.map((m) =>
+              m.id === messageId ? { ...m, transferProgress: progress } : m,
+            );
+            if (progress === undefined) {
+              saveAllMessages(next);
+            }
+            return next;
+          });
+          if (progress === undefined) {
+            refreshStats();
+          }
+        },
+        onMessageAcked: (messageId) => {
+          setMessages((prev) => {
+            let changed = false;
+            const next = prev.map((m) => {
+              if (m.id === messageId && m.status !== 'delivered') {
+                changed = true;
+                return { ...m, status: 'delivered' as const };
+              }
+              return m;
+            });
+            if (changed) {
+              saveAllMessages(next);
+            }
+            return changed ? next : prev;
+          });
+        },
+        onMessageDeleted: (_channelId, messageId) => {
+          void deleteSingleMessage(messageId).then((remaining) => {
+            setMessages(remaining);
+            refreshStats();
+          });
+        },
+        onChannelCleared: (channelId, clearedAt) => {
+          void clearChannelMessages(channelId, clearedAt).then((remaining) => {
+            setMessages(remaining);
+            refreshStats();
+          });
+        },
+        onConnectionStatusChange: (connected, label) => {
+          setMeshConnected(connected);
+          setMeshLabel(label);
+        },
+      },
+      profile.createdAt,
+    );
+
+    engineRef.current = engine;
+    void engine.start(currentMsgs);
+
+    return () => {
+      engine.stop();
+      engineRef.current = null;
+    };
+  }, [profile.peerId, profile.createdAt, persistProfile, refreshStats]);
+
+  useEffect(() => {
+    if (engineRef.current) {
+      engineRef.current.updateLocalName(profile.name);
+    }
+  }, [profile.name]);
+
   const handleToggleTheme = () => {
     const nextTheme = theme === 'dark' ? 'light' : 'dark';
     setTheme(nextTheme);
@@ -356,7 +362,16 @@ export default function App() {
   };
 
   const handleUpdateName = (name: string) => {
-    persistProfile({ ...profile, name });
+    const clean = name.trim();
+    if (!clean) return;
+    const conflict = findUsernameConflict(
+      clean,
+      profile.peerId,
+      onlinePeers,
+      savedContacts,
+    );
+    if (conflict) return;
+    persistProfile({ ...profile, name: clean, customName: true });
   };
 
   const handleSelectChannel = (channelId: string) => {
@@ -398,11 +413,13 @@ export default function App() {
     text: string,
     attachment?: ChatAttachment,
     mediaBlob?: Blob,
-    replyTo?: ReplyRef,
   ) => {
     const msgId = `${profile.peerId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const now = Date.now();
     const recipientId = targetPeer?.peerId ?? targetSavedContact?.peerId;
+    const recipientOnline = recipientId
+      ? onlinePeers.some((p) => p.peerId === recipientId)
+      : onlinePeers.length > 0;
 
     const outbound: ChatMessage = {
       id: msgId,
@@ -412,11 +429,10 @@ export default function App() {
       recipientId,
       text,
       attachment,
-      replyTo,
       timestamp: now,
       status: 'sent',
       transport: targetPeer?.dataChannelOpen ? 'webrtc' : 'local',
-      transferProgress: mediaBlob ? 0 : undefined,
+      transferProgress: mediaBlob && recipientOnline ? 0 : undefined,
     };
 
     const nextMessages = [...messagesRef.current, outbound];
@@ -444,7 +460,6 @@ export default function App() {
         recipientId: outbound.recipientId,
         text: outbound.text,
         attachment: outbound.attachment,
-        replyTo: outbound.replyTo,
         timestamp: outbound.timestamp,
       },
       mediaBlob,
@@ -456,35 +471,6 @@ export default function App() {
     void prepareMediaAttachment(blob, name).then(({ attachment }) => {
       handleSendMessage('', attachment, blob);
     });
-  };
-
-  const handleToggleReaction = (messageId: string, emoji: string) => {
-    const targetMsg = messagesRef.current.find((m) => m.id === messageId);
-    if (!targetMsg) return;
-
-    const alreadyReacted = (targetMsg.reactions?.[emoji] ?? []).includes(
-      profile.peerId,
-    );
-    const add = !alreadyReacted;
-
-    const next = applyReactionUpdate(
-      messagesRef.current,
-      messageId,
-      emoji,
-      profile.peerId,
-      add,
-    );
-    setMessages(next);
-    saveAllMessages(next);
-
-    const recipientId = targetPeer?.peerId ?? targetSavedContact?.peerId;
-    engineRef.current?.sendReaction(
-      activeChannelId,
-      messageId,
-      emoji,
-      add,
-      recipientId,
-    );
   };
 
   const handleTypingChange = (isTyping: boolean) => {
@@ -584,7 +570,6 @@ export default function App() {
         onOpenCamera={() => setCameraModalOpen(true)}
         onSelectChannel={handleSelectChannel}
         onSendMessage={handleSendMessage}
-        onToggleReaction={handleToggleReaction}
         onDeleteMessage={handleDeleteMessage}
         onTypingChange={handleTypingChange}
         onClearChannel={handleClearChannel}

@@ -11,7 +11,6 @@ import {
   Paperclip,
   Plus,
   QrCode,
-  Reply,
   Search,
   SendHorizontal,
   Square,
@@ -22,7 +21,6 @@ import {
   ChatAttachment,
   ChatMessage,
   PeerInfo,
-  ReplyRef,
   TransportKind,
 } from '../types/chat';
 import { getDmChannelId } from '../lib/crypto';
@@ -33,8 +31,6 @@ import {
   prepareMediaAttachment,
 } from '../lib/media';
 import { getMediaObjectUrl } from '../lib/mediaVault';
-
-const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '🔥'];
 
 interface ChatAreaProps {
   localPeerId: string;
@@ -53,9 +49,7 @@ interface ChatAreaProps {
     text: string,
     attachment?: ChatAttachment,
     mediaBlob?: Blob,
-    replyTo?: ReplyRef,
   ) => void;
-  onToggleReaction: (messageId: string, emoji: string) => void;
   onDeleteMessage: (messageId: string) => void;
   onTypingChange: (isTyping: boolean) => void;
   onClearChannel: () => void;
@@ -91,7 +85,11 @@ function transportText(t: TransportKind): string {
   }
 }
 
-function useMediaSrc(attachment?: ChatAttachment, transferProgress?: number): string {
+function useMediaSrc(
+  attachment: ChatAttachment | undefined,
+  transferProgress: number | undefined,
+  isOwn: boolean,
+): string {
   const [src, setSrc] = useState<string>(attachment?.dataUrl ?? '');
 
   useEffect(() => {
@@ -103,7 +101,8 @@ function useMediaSrc(attachment?: ChatAttachment, transferProgress?: number): st
       setSrc(attachment.dataUrl);
       return;
     }
-    if (transferProgress !== undefined) {
+    // Sender already has the media locally in objectUrlCache/IndexedDB, so render immediately
+    if (!isOwn && transferProgress !== undefined) {
       return;
     }
     let active = true;
@@ -115,7 +114,7 @@ function useMediaSrc(attachment?: ChatAttachment, transferProgress?: number): st
     return () => {
       active = false;
     };
-  }, [attachment, transferProgress]);
+  }, [attachment, transferProgress, isOwn]);
 
   return src;
 }
@@ -126,13 +125,15 @@ const PrivateAttachmentView: React.FC<{
   isOwn: boolean;
   onOpenImage: (src: string, name: string) => void;
 }> = ({ attachment, transferProgress, isOwn, onOpenImage }) => {
-  const src = useMediaSrc(attachment, transferProgress);
+  const src = useMediaSrc(attachment, transferProgress, isOwn);
 
-  if (transferProgress !== undefined && !src) {
-    return (
-      <div className="min-w-[200px] space-y-1.5 py-1">
-        <div className="flex items-center justify-between text-xs">
-          <span className="truncate max-w-[160px]">{attachment.name}</span>
+  const progressBar =
+    transferProgress !== undefined ? (
+      <div className="min-w-[200px] space-y-1 pt-1">
+        <div className="flex items-center justify-between text-[11px] opacity-85">
+          <span className="truncate max-w-[160px]">
+            {isOwn ? 'Sending' : 'Loading'} · {formatFileSize(attachment.size)}
+          </span>
           <span className="font-mono tabular-nums">{transferProgress}%</span>
         </div>
         <div className="w-full h-1.5 rounded-full bg-black/15 dark:bg-white/15 overflow-hidden">
@@ -141,6 +142,16 @@ const PrivateAttachmentView: React.FC<{
             style={{ width: `${transferProgress}%` }}
           />
         </div>
+      </div>
+    ) : null;
+
+  if (transferProgress !== undefined && !src) {
+    return (
+      <div className="min-w-[210px] space-y-1.5 py-1">
+        <div className="text-xs font-medium truncate max-w-[240px]">
+          {attachment.name}
+        </div>
+        {progressBar}
       </div>
     );
   }
@@ -154,20 +165,25 @@ const PrivateAttachmentView: React.FC<{
       );
     }
     return (
-      <button
-        type="button"
-        onClick={() => onOpenImage(src, attachment.name)}
-        className="block rounded-lg overflow-hidden focus:outline-none focus:ring-2 focus:ring-white/60"
-      >
-        <img
-          src={src}
-          alt={attachment.name}
-          draggable={false}
-          onContextMenu={(e) => e.preventDefault()}
-          referrerPolicy="no-referrer"
-          className="max-h-72 w-auto max-w-full object-contain rounded-lg cursor-zoom-in select-none"
-        />
-      </button>
+      <div className="space-y-1">
+        <button
+          type="button"
+          onClick={() => onOpenImage(src, attachment.name)}
+          className="block rounded-lg overflow-hidden focus:outline-none focus:ring-2 focus:ring-white/60"
+        >
+          <img
+            src={src}
+            alt={attachment.name}
+            loading="eager"
+            decoding="async"
+            draggable={false}
+            onContextMenu={(e) => e.preventDefault()}
+            referrerPolicy="no-referrer"
+            className="max-h-72 w-auto max-w-full object-contain rounded-lg cursor-zoom-in select-none"
+          />
+        </button>
+        {progressBar}
+      </div>
     );
   }
 
@@ -185,6 +201,7 @@ const PrivateAttachmentView: React.FC<{
           src={src}
           controls
           playsInline
+          preload="metadata"
           controlsList="nodownload noplaybackrate"
           disablePictureInPicture
           onContextMenu={(e) => e.preventDefault()}
@@ -193,15 +210,16 @@ const PrivateAttachmentView: React.FC<{
         <div className="text-[11px] font-mono tabular-nums opacity-75">
           {formatFileSize(attachment.size)} · In-site playback only
         </div>
+        {progressBar}
       </div>
     );
   }
 
-  if (attachment.kind === 'voice') {
+  if (attachment.kind === 'voice' || attachment.mimeType.startsWith('audio/')) {
     if (!src) {
       return (
         <div className="px-3 py-2 text-xs opacity-75">
-          Voice note removed
+          Audio removed from site storage
         </div>
       );
     }
@@ -209,39 +227,44 @@ const PrivateAttachmentView: React.FC<{
       <div className="min-w-[220px] space-y-1">
         <audio
           controls
+          preload="metadata"
           src={src}
           controlsList="nodownload"
           onContextMenu={(e) => e.preventDefault()}
           className="w-full h-9"
         />
-        {attachment.durationMs !== undefined && (
-          <div
-            className={`text-[11px] font-mono tabular-nums ${
-              isOwn ? 'text-blue-100' : 'text-slate-500 dark:text-slate-400'
-            }`}
-          >
-            Voice note · {formatDuration(attachment.durationMs)}
-          </div>
-        )}
+        <div
+          className={`text-[11px] font-mono tabular-nums ${
+            isOwn ? 'text-blue-100' : 'text-slate-500 dark:text-slate-400'
+          }`}
+        >
+          {attachment.kind === 'voice' && attachment.durationMs !== undefined
+            ? `Voice note · ${formatDuration(attachment.durationMs)}`
+            : `${attachment.name} · ${formatFileSize(attachment.size)}`}
+        </div>
+        {progressBar}
       </div>
     );
   }
 
   return (
-    <div
-      className={`flex items-center gap-3 px-3 py-2 rounded-lg ${
-        isOwn
-          ? 'bg-blue-700/70 text-white'
-          : 'bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100'
-      }`}
-    >
-      <FileText className="w-5 h-5 shrink-0" />
-      <div className="min-w-0 flex-1">
-        <div className="text-xs font-medium truncate">{attachment.name}</div>
-        <div className="text-[11px] font-mono tabular-nums opacity-75">
-          {formatFileSize(attachment.size)} · In-site only
+    <div className="space-y-1">
+      <div
+        className={`flex items-center gap-3 px-3 py-2 rounded-lg ${
+          isOwn
+            ? 'bg-blue-700/70 text-white'
+            : 'bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100'
+        }`}
+      >
+        <FileText className="w-5 h-5 shrink-0" />
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-medium truncate">{attachment.name}</div>
+          <div className="text-[11px] font-mono tabular-nums opacity-75">
+            {formatFileSize(attachment.size)} · In-site only
+          </div>
         </div>
       </div>
+      {progressBar}
     </div>
   );
 };
@@ -260,7 +283,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onOpenCamera,
   onSelectChannel,
   onSendMessage,
-  onToggleReaction,
   onDeleteMessage,
   onTypingChange,
   onClearChannel,
@@ -272,7 +294,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     blob: Blob;
     previewUrl: string;
   } | null>(null);
-  const [replyingTo, setReplyingTo] = useState<ReplyRef | null>(null);
   const [mediaError, setMediaError] = useState('');
   const [isDragging, setIsDragging] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<{
@@ -514,28 +535,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       durationMs,
     );
 
-    onSendMessage(
-      '',
-      prepared.attachment,
-      prepared.blob,
-      replyingTo ?? undefined,
-    );
-    setReplyingTo(null);
+    onSendMessage('', prepared.attachment, prepared.blob);
   };
 
   const submitMessage = () => {
     const text = draft.trim();
     if (!text && !pendingMedia) return;
 
-    onSendMessage(
-      text,
-      pendingMedia?.attachment,
-      pendingMedia?.blob,
-      replyingTo ?? undefined,
-    );
+    onSendMessage(text, pendingMedia?.attachment, pendingMedia?.blob);
     setDraft('');
     clearPending();
-    setReplyingTo(null);
     setMediaError('');
     onTypingChange(false);
 
@@ -568,13 +577,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       submitMessage();
-    }
-  };
-
-  const scrollToMessage = (messageId: string) => {
-    const el = document.getElementById(`msg-${messageId}`);
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   };
 
@@ -768,10 +770,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 prev.senderId === msg.senderId &&
                 msg.timestamp - prev.timestamp < 120000;
 
-              const reactionEntries = Object.entries(msg.reactions ?? {}).filter(
-                ([, users]) => users.length > 0,
-              );
-
               return (
                 <React.Fragment key={msg.id}>
                   {showDateDivider && (
@@ -813,25 +811,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                             : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-slate-100'
                         }`}
                       >
-                        {msg.replyTo && (
-                          <button
-                            type="button"
-                            onClick={() => scrollToMessage(msg.replyTo!.messageId)}
-                            className={`w-full text-left px-2.5 py-1.5 rounded-lg text-xs transition-opacity hover:opacity-90 ${
-                              isOwn
-                                ? 'bg-blue-700/70 text-blue-50'
-                                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
-                            }`}
-                          >
-                            <div className="font-semibold truncate">
-                              {msg.replyTo.senderName}
-                            </div>
-                            <div className="truncate opacity-85">
-                              {msg.replyTo.preview}
-                            </div>
-                          </button>
-                        )}
-
                         {msg.attachment && (
                           <PrivateAttachmentView
                             attachment={msg.attachment}
@@ -848,70 +827,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         )}
                       </div>
 
-                      <div className="opacity-0 group-hover:opacity-100 group-focus:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-opacity flex items-center gap-0.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-1 py-0.5 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setReplyingTo({
-                              messageId: msg.id,
-                              senderName: isOwn ? localName : msg.senderName,
-                              preview:
-                                msg.text ||
-                                (msg.attachment
-                                  ? `[${msg.attachment.kind}] ${msg.attachment.name}`
-                                  : ''),
-                            })
-                          }
-                          aria-label="Reply to message"
-                          className="p-1 rounded text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800"
-                        >
-                          <Reply className="w-3.5 h-3.5" />
-                        </button>
-                        {QUICK_EMOJIS.map((emoji) => (
-                          <button
-                            key={emoji}
-                            type="button"
-                            onClick={() => onToggleReaction(msg.id, emoji)}
-                            className="px-1 py-0.5 text-xs rounded hover:bg-slate-100 dark:hover:bg-slate-800"
-                          >
-                            {emoji}
-                          </button>
-                        ))}
+                      <div className="opacity-0 group-hover:opacity-100 group-focus:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-opacity flex items-center bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-0.5 shrink-0">
                         <button
                           type="button"
                           onClick={() => onDeleteMessage(msg.id)}
                           aria-label="Delete message for everyone"
-                          className="p-1 rounded text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30"
+                          className="p-1.5 rounded text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     </div>
-
-                    {reactionEntries.length > 0 && (
-                      <div className="mt-1 px-1 flex flex-wrap items-center gap-1.5">
-                        {reactionEntries.map(([emoji, peerList]) => {
-                          const iReacted = peerList.includes(localPeerId);
-                          return (
-                            <button
-                              key={emoji}
-                              type="button"
-                              onClick={() => onToggleReaction(msg.id, emoji)}
-                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs transition-colors ${
-                                iReacted
-                                  ? 'border-blue-600 bg-blue-600/10 text-blue-700 dark:text-blue-300'
-                                  : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300'
-                              }`}
-                            >
-                              <span>{emoji}</span>
-                              <span className="font-mono text-[11px] tabular-nums">
-                                {peerList.length}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
 
                     <div className="mt-1 px-1 flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-slate-500 font-mono tabular-nums">
                       {isGrouped && <span>{formatTime(msg.timestamp)}</span>}
@@ -961,27 +887,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   {mediaError}
                 </span>
               )}
-            </div>
-          )}
-
-          {replyingTo && (
-            <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs">
-              <div className="min-w-0">
-                <span className="font-semibold text-slate-800 dark:text-slate-200">
-                  Replying to {replyingTo.senderName}:{' '}
-                </span>
-                <span className="text-slate-500 dark:text-slate-400 truncate">
-                  {replyingTo.preview}
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setReplyingTo(null)}
-                aria-label="Cancel reply"
-                className="p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white shrink-0"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
             </div>
           )}
 

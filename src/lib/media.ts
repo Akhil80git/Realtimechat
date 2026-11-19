@@ -72,12 +72,21 @@ export async function prepareMediaAttachment(
   let kind: ChatAttachment['kind'] = 'file';
   if (mime.startsWith('image/')) {
     kind = 'image';
+    // Fast bounded probe for dimensions so multi-megabyte photos never stall UI
     const objUrl = URL.createObjectURL(fileOrBlob);
     try {
       const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+        let done = false;
+        const finish = (w: number, h: number) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve({ w, h });
+        };
+        const timer = window.setTimeout(() => finish(0, 0), 350);
         const img = new Image();
-        img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
-        img.onerror = () => resolve({ w: 0, h: 0 });
+        img.onload = () => finish(img.naturalWidth, img.naturalHeight);
+        img.onerror = () => finish(0, 0);
         img.src = objUrl;
       });
       if (dims.w > 0) {

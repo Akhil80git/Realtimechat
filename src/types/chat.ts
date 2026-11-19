@@ -7,6 +7,7 @@ export interface UserProfile {
   name: string;
   theme: 'light' | 'dark';
   createdAt: number;
+  customName?: boolean;
 }
 
 export interface ChatAttachment {
@@ -23,12 +24,6 @@ export interface ChatAttachment {
   height?: number;
 }
 
-export interface ReplyRef {
-  messageId: string;
-  senderName: string;
-  preview: string;
-}
-
 export interface ChatMessage {
   id: string;
   /** 'lounge' for shared everyone chat, or 'dm:<sortedPeerA>_<sortedPeerB>' for 1-to-1 DM */
@@ -38,8 +33,6 @@ export interface ChatMessage {
   recipientId?: string;
   text: string;
   attachment?: ChatAttachment;
-  replyTo?: ReplyRef;
-  reactions?: Record<string, string[]>;
   timestamp: number;
   status: DeliveryStatus;
   transport: TransportKind;
@@ -51,6 +44,7 @@ export interface PeerInfo {
   peerId: string;
   name: string;
   lastSeen: number;
+  createdAt?: number;
   webrtcState: RTCPeerConnectionState | 'idle';
   dataChannelOpen: boolean;
   sameDevice: boolean;
@@ -75,13 +69,11 @@ export interface StorageStats {
 export interface OutboxItem {
   opId: string;
   targetPeerId: string;
-  kind: 'chat' | 'delete-msg' | 'clear-chat' | 'reaction';
+  kind: 'chat' | 'delete-msg' | 'clear-chat';
   channelId: string;
   createdAt: number;
   message?: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
   messageId?: string;
-  emoji?: string;
-  add?: boolean;
 }
 
 export type WirePacket =
@@ -89,6 +81,12 @@ export type WirePacket =
       kind: 'chat';
       opId?: string;
       message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
+    }
+  | {
+      kind: 'media-blob';
+      opId?: string;
+      message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
+      blob: Blob;
     }
   | {
       kind: 'media-meta';
@@ -103,15 +101,6 @@ export type WirePacket =
       index: number;
       totalChunks: number;
       data: string;
-    }
-  | {
-      kind: 'reaction';
-      opId?: string;
-      channelId: string;
-      messageId: string;
-      emoji: string;
-      peerId: string;
-      add: boolean;
     }
   | {
       kind: 'delete-msg';
@@ -142,6 +131,7 @@ export type WirePacket =
       kind: 'sync-hello';
       peerId: string;
       name: string;
+      createdAt?: number;
       timestamp: number;
     }
   | {
@@ -156,6 +146,7 @@ export type WirePacket =
       kind: 'hello';
       peerId: string;
       name: string;
+      createdAt?: number;
       timestamp: number;
     };
 

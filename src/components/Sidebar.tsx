@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import { PeerInfo, StorageStats, StoredContact, UserProfile } from '../types/chat';
-import { getDmChannelId } from '../lib/crypto';
+import { findUsernameConflict, getDmChannelId } from '../lib/crypto';
 import { formatFileSize } from '../lib/media';
 
 interface SidebarProps {
@@ -58,13 +58,26 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [userSearch, setUserSearch] = useState('');
 
+  const trimmedDraft = draftName.trim();
+  const isSameAsCurrent =
+    trimmedDraft.toLowerCase() === profile.name.trim().toLowerCase();
+  const nameConflict =
+    editingName && trimmedDraft.length > 0 && !isSameAsCurrent
+      ? findUsernameConflict(trimmedDraft, profile.peerId, onlinePeers, savedContacts)
+      : null;
+
   const handleSaveName = (e: React.FormEvent) => {
     e.preventDefault();
-    const clean = draftName.trim();
-    if (clean) {
-      onUpdateName(clean);
-    } else {
+    if (!trimmedDraft) {
       setDraftName(profile.name);
+      setEditingName(false);
+      return;
+    }
+    if (nameConflict) {
+      return;
+    }
+    if (trimmedDraft !== profile.name) {
+      onUpdateName(trimmedDraft);
     }
     setEditingName(false);
   };
@@ -124,23 +137,54 @@ export const Sidebar: React.FC<SidebarProps> = ({
       {/* Your Account */}
       <div className="px-4 py-3.5 border-b border-slate-200 dark:border-slate-800">
         {editingName ? (
-          <form onSubmit={handleSaveName} className="flex items-center gap-1.5">
-            <input
-              type="text"
-              autoFocus
-              maxLength={32}
-              value={draftName}
-              onChange={(e) => setDraftName(e.target.value)}
-              className="flex-1 min-w-0 px-2.5 py-1.5 text-sm rounded-md border border-blue-600 bg-white dark:bg-slate-950 text-slate-900 dark:text-white focus:outline-none"
-            />
-            <button
-              type="submit"
-              aria-label="Save name"
-              className="p-1.5 rounded-md bg-blue-600 text-white hover:bg-blue-700 shrink-0"
-            >
-              <Check className="w-4 h-4" />
-            </button>
-          </form>
+          <div className="space-y-1.5">
+            <form onSubmit={handleSaveName} className="flex items-center gap-1.5">
+              <input
+                type="text"
+                autoFocus
+                maxLength={32}
+                value={draftName}
+                onChange={(e) => setDraftName(e.target.value)}
+                aria-label="Edit username"
+                className={`flex-1 min-w-0 px-2.5 py-1.5 text-sm rounded-md border bg-white dark:bg-slate-950 text-slate-900 dark:text-white focus:outline-none ${
+                  nameConflict
+                    ? 'border-red-500'
+                    : 'border-blue-600'
+                }`}
+              />
+              <button
+                type="submit"
+                disabled={Boolean(nameConflict) || !trimmedDraft}
+                aria-label="Save name"
+                className="p-1.5 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+              >
+                <Check className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setDraftName(profile.name);
+                  setEditingName(false);
+                }}
+                aria-label="Cancel rename"
+                className="p-1.5 rounded-md border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-slate-800 dark:hover:text-white shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </form>
+
+            {nameConflict ? (
+              <p className="text-[11px] font-medium text-red-600 dark:text-red-400" role="alert">
+                {nameConflict.source === 'online'
+                  ? `"${nameConflict.existingName}" is already used by someone online.`
+                  : `"${nameConflict.existingName}" is already used by another contact.`}
+              </p>
+            ) : trimmedDraft && !isSameAsCurrent ? (
+              <p className="text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
+                Username "{trimmedDraft}" is available
+              </p>
+            ) : null}
+          </div>
         ) : (
           <div className="flex items-center justify-between gap-2">
             <div className="min-w-0">
