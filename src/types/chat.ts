@@ -9,6 +9,23 @@ export interface UserProfile {
   createdAt: number;
 }
 
+export interface ChatAttachment {
+  kind: 'image' | 'voice' | 'file';
+  name: string;
+  mimeType: string;
+  size: number;
+  dataUrl: string;
+  durationMs?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface ReplyRef {
+  messageId: string;
+  senderName: string;
+  preview: string;
+}
+
 export interface ChatMessage {
   id: string;
   /** 'lounge' for shared everyone chat, or 'dm:<sortedPeerA>_<sortedPeerB>' for 1-to-1 DM */
@@ -17,6 +34,10 @@ export interface ChatMessage {
   senderName: string;
   recipientId?: string;
   text: string;
+  attachment?: ChatAttachment;
+  replyTo?: ReplyRef;
+  /** Map of emoji -> array of peerIds who reacted */
+  reactions?: Record<string, string[]>;
   timestamp: number;
   status: DeliveryStatus;
   transport: TransportKind;
@@ -51,6 +72,21 @@ export type WirePacket =
   | {
       kind: 'chat';
       message: Omit<ChatMessage, 'status' | 'transport'>;
+    }
+  | {
+      kind: 'chunk';
+      transferId: string;
+      index: number;
+      total: number;
+      data: string;
+    }
+  | {
+      kind: 'reaction';
+      channelId: string;
+      messageId: string;
+      emoji: string;
+      peerId: string;
+      add: boolean;
     }
   | {
       kind: 'ack';

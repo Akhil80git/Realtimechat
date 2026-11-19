@@ -28,11 +28,20 @@ const ICE_SERVERS: RTCIceServer[] = [
 const HEARTBEAT_MS = 12000;
 const PEER_TTL_MS = 45000;
 const TYPING_TTL_MS = 2600;
+const CHUNK_SIZE_CHARS = 28000;
+const CHUNK_ASSEMBLY_TTL_MS = 45000;
 
 export interface EngineCallbacks {
   onPeersChange: (peers: PeerInfo[]) => void;
   onMessageReceived: (message: ChatMessage) => void;
   onMessageAcked: (messageId: string) => void;
+  onReactionReceived: (
+    channelId: string,
+    messageId: string,
+    emoji: string,
+    peerId: string,
+    add: boolean,
+  ) => void;
   onConnectionStatusChange: (connected: boolean, brokerLabel: string) => void;
 }
 
@@ -44,6 +53,14 @@ interface PeerConnectionEntry {
   ignoreOffer: boolean;
   pendingIce: RTCIceCandidateInit[];
   remoteDescSet: boolean;
+}
+
+interface ChunkBuffer {
+  total: number;
+  parts: (string | undefined)[];
+  received: number;
+  createdAt: number;
+  transport: TransportKind;
 }
 
 export class P2PChatEngine {
@@ -59,6 +76,7 @@ export class P2PChatEngine {
   private rtcEntries = new Map<string, PeerConnectionEntry>();
   private seenMessageIds = new Set<string>();
   private seenSignalIds = new Set<string>();
+  private chunkBuffers = new Map<string, ChunkBuffer>();
 
   private heartbeatTimer: number | null = null;
   private cleanupTimer: number | null = null;
@@ -86,6 +104,7 @@ export class P2PChatEngine {
     this.destroyed = false;
     this.seenMessageIds.clear();
     this.seenSignalIds.clear();
+    this.chunkBuffers.clear();
     for (const m of existingMessages) {
       this.seenMessageIds.add(m.id);
     }
@@ -157,6 +176,7 @@ export class P2PChatEngine {
       this.closeRtcEntry(entry);
     }
     this.rtcEntries.clear();
+    this.chunkBuffers.clear();
     this.peers.clear();
     this.callbacks.onPeersChange([]);
     this.callbacks.onConnectionStatusChange(false, 'Disconnected');
@@ -171,7 +191,46 @@ export class P2PChatEngine {
       kind: 'chat',
       message,
     };
-    await this.dispatchWirePacket(packet, targetPeerId, true);
+    const json = JSON.stringify(packet);
+
+    if (json.length <= CHUNK_SIZE_CHARS) {
+      await this.dispatchWirePacket(packet, targetPeerId, true);
+      return;
+    }
+
+    // Split large media/image/voice/file messages into ordered 28KB chunks
+    const total = Math.ceil(json.length / CHUNK_SIZE_CHARS);
+    const transferId = `${message.id}_t`;
+    for (let i = 0; i < total; i++) {
+      if (this.destroyed) return;
+      const slice = json.slice(i * CHUNK_SIZE_CHARS, (i + 1) * CHUNK_SIZE_CHARS);
+      const chunkPkt: WirePacket = {
+        kind: 'chunk',
+        transferId,
+        index: i,
+        total,
+        data: slice,
+      };
+      await this.dispatchWirePacket(chunkPkt, targetPeerId, true);
+    }
+  }
+
+  public sendReaction(
+    channelId: string,
+    messageId: string,
+    emoji: string,
+    add: boolean,
+    targetPeerId?: string,
+  ): void {
+    const packet: WirePacket = {
+      kind: 'reaction',
+      channelId,
+      messageId,
+      emoji,
+      peerId: this.localPeerId,
+      add,
+    };
+    void this.dispatchWirePacket(packet, targetPeerId, true);
   }
 
   public sendTyping(
@@ -253,7 +312,6 @@ export class P2PChatEngine {
 
     this.client = client;
 
-    // Failover to backup broker if primary does not connect within 6s
     this.failoverTimer = window.setTimeout(() => {
       if (!this.destroyed && !client.connected) {
         this.connectBroker(this.brokerIndex + 1);
@@ -383,7 +441,7 @@ export class P2PChatEngine {
   private async dispatchWirePacket(
     packet: WirePacket,
     targetPeerId: string | undefined,
-    isChatMessage: boolean,
+    isImportant: boolean,
   ): Promise<void> {
     const serialized = JSON.stringify(packet);
 
@@ -426,10 +484,9 @@ export class P2PChatEngine {
       }
     }
 
-    // 3. Encrypted Ephemeral Relay (retain: false -> zero data stored on relay!)
+    // 3. Encrypted Ephemeral Relay (retain: false -> zero data stored on relay)
     if (this.client?.connected && this.aesKey) {
-      // For typing/acks when WebRTC direct is already open, skip relay if direct succeeded
-      if (!isChatMessage && deliveredDirect && targetPeerId) return;
+      if (!isImportant && deliveredDirect && targetPeerId) return;
 
       try {
         const cipher = await encryptPacket(this.aesKey, packet);
@@ -438,7 +495,7 @@ export class P2PChatEngine {
           : `${TOPIC_PREFIX}/lounge`;
         this.client.publish(topic, cipher, {
           retain: false,
-          qos: isChatMessage ? 1 : 0,
+          qos: isImportant ? 1 : 0,
         });
       } catch {
         // Ignore
@@ -512,6 +569,11 @@ export class P2PChatEngine {
   }
 
   private handleWirePacket(pkt: WirePacket, transport: TransportKind): void {
+    if (pkt.kind === 'chunk') {
+      this.handleChunkPacket(pkt, transport);
+      return;
+    }
+
     if (pkt.kind === 'hello') {
       if (pkt.peerId === this.localPeerId) return;
       const existing = this.peers.get(pkt.peerId);
@@ -536,6 +598,18 @@ export class P2PChatEngine {
         p.typingUntil = pkt.isTyping ? Date.now() + TYPING_TTL_MS : 0;
         this.emitPeers();
       }
+      return;
+    }
+
+    if (pkt.kind === 'reaction') {
+      if (pkt.peerId === this.localPeerId) return;
+      this.callbacks.onReactionReceived(
+        pkt.channelId,
+        pkt.messageId,
+        pkt.emoji,
+        pkt.peerId,
+        pkt.add,
+      );
       return;
     }
 
@@ -581,6 +655,43 @@ export class P2PChatEngine {
         channelId: m.channelId,
       };
       void this.dispatchWirePacket(ack, m.senderId, false);
+    }
+  }
+
+  private handleChunkPacket(
+    pkt: Extract<WirePacket, { kind: 'chunk' }>,
+    transport: TransportKind,
+  ): void {
+    if (pkt.total <= 0 || pkt.index < 0 || pkt.index >= pkt.total) return;
+
+    let buf = this.chunkBuffers.get(pkt.transferId);
+    if (!buf) {
+      buf = {
+        total: pkt.total,
+        parts: new Array<string | undefined>(pkt.total),
+        received: 0,
+        createdAt: Date.now(),
+        transport,
+      };
+      this.chunkBuffers.set(pkt.transferId, buf);
+    }
+
+    if (buf.parts[pkt.index] === undefined) {
+      buf.parts[pkt.index] = pkt.data;
+      buf.received++;
+    }
+
+    if (buf.received === buf.total) {
+      this.chunkBuffers.delete(pkt.transferId);
+      try {
+        const fullJson = buf.parts.join('');
+        const inner = JSON.parse(fullJson) as WirePacket;
+        if (inner.kind !== 'chunk') {
+          this.handleWirePacket(inner, buf.transport);
+        }
+      } catch {
+        // Ignore corrupted reassembly
+      }
     }
   }
 
@@ -844,6 +955,11 @@ export class P2PChatEngine {
         peer.typingUntil = 0;
         peer.typingChannelId = null;
         changed = true;
+      }
+    }
+    for (const [tid, buf] of this.chunkBuffers.entries()) {
+      if (now - buf.createdAt > CHUNK_ASSEMBLY_TTL_MS) {
+        this.chunkBuffers.delete(tid);
       }
     }
     if (changed) {

@@ -17,8 +17,10 @@ import {
   upsertContact,
 } from './lib/storage';
 import {
+  ChatAttachment,
   ChatMessage,
   PeerInfo,
+  ReplyRef,
   StorageStats,
   StoredContact,
   UserProfile,
@@ -44,6 +46,36 @@ function saveSessionProfileOverride(profile: UserProfile): void {
   } catch {
     // Ignore
   }
+}
+
+function applyReactionUpdate(
+  list: ChatMessage[],
+  messageId: string,
+  emoji: string,
+  peerId: string,
+  add: boolean,
+): ChatMessage[] {
+  let changed = false;
+  const next = list.map((m) => {
+    if (m.id !== messageId) return m;
+    const current = { ...(m.reactions ?? {}) };
+    const users = new Set(current[emoji] ?? []);
+    if (add) {
+      if (users.has(peerId)) return m;
+      users.add(peerId);
+    } else {
+      if (!users.has(peerId)) return m;
+      users.delete(peerId);
+    }
+    changed = true;
+    if (users.size === 0) {
+      delete current[emoji];
+    } else {
+      current[emoji] = Array.from(users);
+    }
+    return { ...m, reactions: current };
+  });
+  return changed ? next : list;
 }
 
 export default function App() {
@@ -120,12 +152,18 @@ export default function App() {
           return next;
         });
 
+        const preview =
+          incoming.text.slice(0, 48) ||
+          (incoming.attachment
+            ? `[${incoming.attachment.kind}] ${incoming.attachment.name}`
+            : '');
+
         setSavedContacts(
           upsertContact(
             incoming.senderId,
             incoming.senderName,
             incoming.timestamp,
-            incoming.text.slice(0, 48),
+            preview,
             incoming.timestamp,
           ),
         );
@@ -153,6 +191,15 @@ export default function App() {
             saveAllMessages(next);
           }
           return changed ? next : prev;
+        });
+      },
+      onReactionReceived: (_channelId, messageId, emoji, peerId, add) => {
+        setMessages((prev) => {
+          const next = applyReactionUpdate(prev, messageId, emoji, peerId, add);
+          if (next !== prev) {
+            saveAllMessages(next);
+          }
+          return next;
         });
       },
       onConnectionStatusChange: (connected, label) => {
@@ -254,7 +301,11 @@ export default function App() {
     return 'Direct Message';
   }, [activeChannelId, targetPeer, targetSavedContact]);
 
-  const handleSendMessage = (text: string) => {
+  const handleSendMessage = (
+    text: string,
+    attachment?: ChatAttachment,
+    replyTo?: ReplyRef,
+  ) => {
     if (!profile) return;
     const msgId = `${profile.peerId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const now = Date.now();
@@ -267,6 +318,8 @@ export default function App() {
       senderName: profile.name,
       recipientId,
       text,
+      attachment,
+      replyTo,
       timestamp: now,
       status: 'sent',
       transport: targetPeer?.dataChannelOpen ? 'webrtc' : 'local',
@@ -278,8 +331,11 @@ export default function App() {
 
     if (recipientId) {
       const recipientName = targetPeer?.name ?? targetSavedContact?.name ?? 'User';
+      const preview =
+        text.slice(0, 48) ||
+        (attachment ? `[${attachment.kind}] ${attachment.name}` : '');
       setSavedContacts(
-        upsertContact(recipientId, recipientName, now, `You: ${text.slice(0, 48)}`, now),
+        upsertContact(recipientId, recipientName, now, `You: ${preview}`, now),
       );
     }
 
@@ -293,8 +349,40 @@ export default function App() {
         senderName: outbound.senderName,
         recipientId: outbound.recipientId,
         text: outbound.text,
+        attachment: outbound.attachment,
+        replyTo: outbound.replyTo,
         timestamp: outbound.timestamp,
       },
+      recipientId,
+    );
+  };
+
+  const handleToggleReaction = (messageId: string, emoji: string) => {
+    if (!profile) return;
+    const targetMsg = messagesRef.current.find((m) => m.id === messageId);
+    if (!targetMsg) return;
+
+    const alreadyReacted = (targetMsg.reactions?.[emoji] ?? []).includes(
+      profile.peerId,
+    );
+    const add = !alreadyReacted;
+
+    const next = applyReactionUpdate(
+      messagesRef.current,
+      messageId,
+      emoji,
+      profile.peerId,
+      add,
+    );
+    setMessages(next);
+    saveAllMessages(next);
+
+    const recipientId = targetPeer?.peerId ?? targetSavedContact?.peerId;
+    engineRef.current?.sendReaction(
+      activeChannelId,
+      messageId,
+      emoji,
+      add,
       recipientId,
     );
   };
@@ -397,6 +485,7 @@ export default function App() {
         onOpenMobileSidebar={() => setMobileSidebarOpen(true)}
         onSelectChannel={handleSelectChannel}
         onSendMessage={handleSendMessage}
+        onToggleReaction={handleToggleReaction}
         onTypingChange={handleTypingChange}
         onClearChannel={handleClearChannel}
       />

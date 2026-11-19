@@ -19,13 +19,24 @@ function safeSet(key: string, value: unknown): void {
     localStorage.setItem(key, JSON.stringify(value));
   } catch {
     try {
+      // First free space by stripping oldest media payloads while keeping text messages intact
       const msgs = safeParse<ChatMessage[]>(localStorage.getItem(MSG_KEY), []);
-      if (msgs.length > 200) {
-        localStorage.setItem(MSG_KEY, JSON.stringify(msgs.slice(-200)));
-      }
+      let freed = 0;
+      const compacted = msgs.map((m) => {
+        if (m.attachment && freed < 15) {
+          freed++;
+          const { attachment, ...rest } = m;
+          return {
+            ...rest,
+            text: rest.text || `[${attachment.kind}: ${attachment.name}]`,
+          };
+        }
+        return m;
+      });
+      localStorage.setItem(MSG_KEY, JSON.stringify(compacted.slice(-400)));
       localStorage.setItem(key, JSON.stringify(value));
     } catch {
-      // Ignore quota errors
+      // Ignore if browser storage is full
     }
   }
 }
