@@ -1,0 +1,6 @@
+{
+  "name": "Varta",
+  "description": "Zero-backend peer-to-peer real-time chat powered by WebRTC DataChannels, Gun.js mesh signaling, and browser localStorage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
