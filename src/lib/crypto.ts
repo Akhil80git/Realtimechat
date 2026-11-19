@@ -1,4 +1,4 @@
-const ROOM_SALT = new TextEncoder().encode('varta-p2p-room-salt-v1');
+const APP_SALT = new TextEncoder().encode('varta-global-mesh-salt-v2');
 
 export function generatePeerId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -7,34 +7,14 @@ export function generatePeerId(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 }
 
-export function generateRoomCode(): string {
-  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
-  const bytes = new Uint8Array(6);
-  crypto.getRandomValues(bytes);
-  let code = '';
-  for (let i = 0; i < bytes.length; i++) {
-    code += chars[bytes[i] % chars.length];
-  }
-  return `${code.slice(0, 3)}-${code.slice(3, 6)}`;
-}
-
 export function getDmChannelId(peerA: string, peerB: string): string {
   return peerA < peerB ? `dm:${peerA}_${peerB}` : `dm:${peerB}_${peerA}`;
 }
 
-export async function deriveRoomHash(roomCode: string): Promise<string> {
-  const normalized = roomCode.trim().toLowerCase();
-  const data = new TextEncoder().encode(`varta:room:${normalized}`);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 24);
-}
-
-export async function deriveRoomAesKey(roomCode: string): Promise<CryptoKey> {
-  const normalized = roomCode.trim().toLowerCase();
+export async function deriveAesKey(secretSeed: string): Promise<CryptoKey> {
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
-    new TextEncoder().encode(normalized),
+    new TextEncoder().encode(secretSeed),
     'PBKDF2',
     false,
     ['deriveKey'],
@@ -43,8 +23,8 @@ export async function deriveRoomAesKey(roomCode: string): Promise<CryptoKey> {
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
-      salt: ROOM_SALT,
-      iterations: 20000,
+      salt: APP_SALT,
+      iterations: 15000,
       hash: 'SHA-256',
     },
     keyMaterial,

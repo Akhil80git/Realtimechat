@@ -1,41 +1,29 @@
 import React, { useState } from 'react';
-import { ArrowRight, RefreshCw, Sun, Moon } from 'lucide-react';
-import { generateRoomCode } from '../lib/crypto';
+import { ArrowRight, Moon, Sun } from 'lucide-react';
 
 interface OnboardingViewProps {
-  initialName?: string;
-  initialRoom: string;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
-  onComplete: (name: string, roomCode: string) => void;
+  onComplete: (name: string) => void;
 }
 
 export const OnboardingView: React.FC<OnboardingViewProps> = ({
-  initialName = '',
-  initialRoom,
   theme,
   onToggleTheme,
   onComplete,
 }) => {
-  const [name, setName] = useState(initialName);
-  const [roomCode, setRoomCode] = useState(initialRoom);
+  const [name, setName] = useState('');
   const [error, setError] = useState('');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const cleanName = name.trim();
-    const cleanRoom = roomCode.trim().toLowerCase().replace(/[^a-z0-9-_]/g, '');
-
     if (!cleanName) {
-      setError('Please enter your display name.');
-      return;
-    }
-    if (!cleanRoom) {
-      setError('Please enter a room code.');
+      setError('Please enter your name to continue.');
       return;
     }
     setError('');
-    onComplete(cleanName, cleanRoom);
+    onComplete(cleanName);
   };
 
   return (
@@ -45,16 +33,14 @@ export const OnboardingView: React.FC<OnboardingViewProps> = ({
           <span className="font-display text-xl font-bold tracking-tight whitespace-nowrap shrink-0">
             Varta
           </span>
-          <div className="flex items-center gap-4 shrink-0">
-            <button
-              type="button"
-              onClick={onToggleTheme}
-              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-              className="p-2 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-            >
-              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={onToggleTheme}
+            aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            className="p-2 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+          >
+            {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
         </div>
       </header>
 
@@ -62,27 +48,27 @@ export const OnboardingView: React.FC<OnboardingViewProps> = ({
         <div className="w-full max-w-4xl grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-12 items-center">
           <div className="lg:col-span-6 space-y-5">
             <p className="text-xs font-medium text-slate-500 dark:text-slate-400">
-              WebRTC Direct · Gun.js Mesh · LocalStorage Only
+              WebRTC Direct · Live Discovery · LocalStorage Only
             </p>
             <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-slate-900 dark:text-white leading-tight [text-wrap:balance]">
-              Direct peer-to-peer chat with zero backend.
+              Enter your name and chat directly with anyone online.
             </h1>
             <p className="text-base text-slate-600 dark:text-slate-400 leading-relaxed max-w-md">
-              Pick a name and enter a shared room code. Your browser connects directly to the other person over WebRTC and saves your conversation solely in your own device storage.
+              Open this site on any phone or browser. Type your name once to create your local account, see everyone who is online right now, and message anyone directly.
             </p>
 
             <div className="pt-2 space-y-3 border-t border-slate-200 dark:border-slate-800 text-sm text-slate-600 dark:text-slate-400">
               <div className="flex items-baseline gap-3">
                 <span className="font-mono text-xs text-slate-400 dark:text-slate-500 tabular-nums">01</span>
-                <span>Each person enters any display name on their own device.</span>
+                <span>Enter your name — no email, password, or room code needed.</span>
               </div>
               <div className="flex items-baseline gap-3">
                 <span className="font-mono text-xs text-slate-400 dark:text-slate-500 tabular-nums">02</span>
-                <span>Share the room link or code to connect in real time.</span>
+                <span>Everyone online on any device appears live in your people list.</span>
               </div>
               <div className="flex items-baseline gap-3">
                 <span className="font-mono text-xs text-slate-400 dark:text-slate-500 tabular-nums">03</span>
-                <span>All chat history stays strictly inside browser localStorage.</span>
+                <span>All conversations are saved strictly inside your own browser storage.</span>
               </div>
             </div>
           </div>
@@ -94,60 +80,30 @@ export const OnboardingView: React.FC<OnboardingViewProps> = ({
             >
               <div>
                 <h2 className="font-display text-xl font-semibold text-slate-900 dark:text-white">
-                  Join a conversation
+                  Create your local account
                 </h2>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-                  No sign-up or account required.
+                  Saved on this device only.
                 </p>
               </div>
 
-              <div className="space-y-4">
-                <div>
-                  <label
-                    htmlFor="display-name"
-                    className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5"
-                  >
-                    Your Name
-                  </label>
-                  <input
-                    id="display-name"
-                    type="text"
-                    maxLength={32}
-                    autoFocus
-                    placeholder="e.g. Aarav, Priya"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 text-sm"
-                  />
-                </div>
-
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label
-                      htmlFor="room-code"
-                      className="block text-sm font-medium text-slate-700 dark:text-slate-300"
-                    >
-                      Room Code
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => setRoomCode(generateRoomCode())}
-                      className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap shrink-0"
-                    >
-                      <RefreshCw className="w-3 h-3" />
-                      Generate New
-                    </button>
-                  </div>
-                  <input
-                    id="room-code"
-                    type="text"
-                    maxLength={40}
-                    placeholder="e.g. lobby or x7k-92p"
-                    value={roomCode}
-                    onChange={(e) => setRoomCode(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 text-sm font-mono"
-                  />
-                </div>
+              <div>
+                <label
+                  htmlFor="display-name"
+                  className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5"
+                >
+                  Your Name
+                </label>
+                <input
+                  id="display-name"
+                  type="text"
+                  maxLength={32}
+                  autoFocus
+                  placeholder="e.g. Rahul, Priya, Aman"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 text-sm"
+                />
               </div>
 
               {error && (
@@ -160,7 +116,7 @@ export const OnboardingView: React.FC<OnboardingViewProps> = ({
                 type="submit"
                 className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-2 whitespace-nowrap shrink-0"
               >
-                <span>Enter Chat</span>
+                <span>Join Chat</span>
                 <ArrowRight className="w-4 h-4" />
               </button>
             </form>

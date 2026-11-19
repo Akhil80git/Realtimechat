@@ -1,4 +1,4 @@
-export type TransportKind = 'webrtc' | 'broadcast' | 'gun' | 'local';
+export type TransportKind = 'webrtc' | 'broadcast' | 'relay' | 'local';
 
 export type DeliveryStatus = 'sending' | 'sent' | 'delivered';
 
@@ -11,11 +11,11 @@ export interface UserProfile {
 
 export interface ChatMessage {
   id: string;
-  roomCode: string;
-  /** 'room' for shared room conversation, or 'dm:<sortedPeerA>_<sortedPeerB>' for 1-to-1 DM */
+  /** 'lounge' for shared everyone chat, or 'dm:<sortedPeerA>_<sortedPeerB>' for 1-to-1 DM */
   channelId: string;
   senderId: string;
   senderName: string;
+  recipientId?: string;
   text: string;
   timestamp: number;
   status: DeliveryStatus;
@@ -29,12 +29,14 @@ export interface PeerInfo {
   webrtcState: RTCPeerConnectionState | 'idle';
   dataChannelOpen: boolean;
   sameDevice: boolean;
+  typingChannelId: string | null;
   typingUntil: number;
 }
 
-export interface RoomMeta {
-  roomCode: string;
-  joinedAt: number;
+export interface StoredContact {
+  peerId: string;
+  name: string;
+  lastSeen: number;
   lastMessageAt: number;
   lastPreview: string;
 }
@@ -42,7 +44,6 @@ export interface RoomMeta {
 export interface StorageStats {
   totalBytes: number;
   messageCount: number;
-  roomCount: number;
   contactCount: number;
 }
 

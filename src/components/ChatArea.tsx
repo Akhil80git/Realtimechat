@@ -4,25 +4,25 @@ import {
   CheckCheck,
   Copy,
   ExternalLink,
-  Link2,
   Menu,
   SendHorizontal,
   Trash2,
 } from 'lucide-react';
 import { ChatMessage, PeerInfo, TransportKind } from '../types/chat';
+import { getDmChannelId } from '../lib/crypto';
 
 interface ChatAreaProps {
   localPeerId: string;
   localName: string;
-  activeRoom: string;
   activeChannelId: string;
   channelTitle: string;
   targetPeer: PeerInfo | null;
   onlinePeers: PeerInfo[];
   messages: ChatMessage[];
-  inviteUrl: string;
+  shareUrl: string;
+  secondTabUrl: string;
   onOpenMobileSidebar: () => void;
-  onOpenManualPair: () => void;
+  onSelectChannel: (channelId: string) => void;
   onSendMessage: (text: string) => void;
   onTypingChange: (isTyping: boolean) => void;
   onClearChannel: () => void;
@@ -51,8 +51,8 @@ function transportText(t: TransportKind): string {
       return 'WebRTC';
     case 'broadcast':
       return 'Local Tab';
-    case 'gun':
-      return 'Mesh';
+    case 'relay':
+      return 'Direct';
     default:
       return 'Saved';
   }
@@ -61,21 +61,21 @@ function transportText(t: TransportKind): string {
 export const ChatArea: React.FC<ChatAreaProps> = ({
   localPeerId,
   localName,
-  activeRoom,
   activeChannelId,
   channelTitle,
   targetPeer,
   onlinePeers,
   messages,
-  inviteUrl,
+  shareUrl,
+  secondTabUrl,
   onOpenMobileSidebar,
-  onOpenManualPair,
+  onSelectChannel,
   onSendMessage,
   onTypingChange,
   onClearChannel,
 }) => {
   const [draft, setDraft] = useState('');
-  const [copiedInvite, setCopiedInvite] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
@@ -92,34 +92,42 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const typingPeers = useMemo(() => {
     const now = Date.now();
     if (targetPeer) {
-      return targetPeer.typingUntil > now ? [targetPeer] : [];
+      return targetPeer.typingUntil > now &&
+        targetPeer.typingChannelId === activeChannelId
+        ? [targetPeer]
+        : [];
     }
-    return onlinePeers.filter((p) => p.typingUntil > now);
-  }, [onlinePeers, targetPeer]);
+    return onlinePeers.filter(
+      (p) => p.typingUntil > now && p.typingChannelId === activeChannelId,
+    );
+  }, [activeChannelId, onlinePeers, targetPeer]);
 
   const connectionSummary = useMemo(() => {
     if (targetPeer) {
       if (targetPeer.dataChannelOpen) return 'WebRTC Direct · Saved locally';
       if (targetPeer.sameDevice) return 'Same-Device Channel · Saved locally';
-      return 'Mesh Relay · Saved locally';
+      return 'Direct Live · Saved locally';
+    }
+    if (activeChannelId !== 'lounge') {
+      return 'Offline right now · Saved locally';
     }
     const directCount = onlinePeers.filter((p) => p.dataChannelOpen).length;
     if (directCount > 0) {
-      return `${onlinePeers.length + 1} in room · ${directCount} WebRTC direct`;
+      return `${onlinePeers.length + 1} online · ${directCount} WebRTC direct`;
     }
     if (onlinePeers.length > 0) {
-      return `${onlinePeers.length + 1} in room · Real-time sync`;
+      return `${onlinePeers.length + 1} online · Real-time sync`;
     }
-    return `Waiting for peers in ${activeRoom} · Saved locally`;
-  }, [activeRoom, onlinePeers, targetPeer]);
+    return 'Waiting for friends to open the site · Saved locally';
+  }, [activeChannelId, onlinePeers, targetPeer]);
 
-  const handleCopyInvite = async () => {
+  const handleCopyShare = async () => {
     try {
-      await navigator.clipboard.writeText(inviteUrl);
-      setCopiedInvite(true);
-      setTimeout(() => setCopiedInvite(false), 2000);
+      await navigator.clipboard.writeText(shareUrl);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2000);
     } catch {
-      // Fallback ignored
+      // Ignore clipboard failure
     }
   };
 
@@ -169,7 +177,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           <button
             type="button"
             onClick={onOpenMobileSidebar}
-            aria-label="Open conversations menu"
+            aria-label="Open people list"
             className="lg:hidden p-2 -ml-1 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
           >
             <Menu className="w-5 h-5" />
@@ -186,16 +194,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={onOpenManualPair}
-            aria-label="Pair manually via WebRTC code"
-            className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-          >
-            <Link2 className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Pair Manually</span>
-          </button>
-
           {channelMessages.length > 0 && (
             <button
               type="button"
@@ -209,11 +207,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
           <button
             type="button"
-            onClick={() => void handleCopyInvite()}
+            onClick={() => void handleCopyShare()}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium transition-colors whitespace-nowrap shrink-0"
           >
-            {copiedInvite ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-            <span>{copiedInvite ? 'Link Copied' : 'Share Invite'}</span>
+            {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{copiedLink ? 'Link Copied' : 'Share Site Link'}</span>
           </button>
         </div>
       </header>
@@ -225,37 +223,58 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <div className="max-w-md w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 text-center space-y-4">
               <div className="space-y-1.5">
                 <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">
-                  Ready to chat as {localName}
+                  {targetPeer
+                    ? `Start chatting with ${targetPeer.name}`
+                    : `Signed in as ${localName}`}
                 </h2>
                 <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Send this invite link to another device or open it in a second browser tab. Once they enter their name, messages flow directly in real time.
+                  {targetPeer
+                    ? `Your messages go directly to ${targetPeer.name} in real time and stay saved in your device storage.`
+                    : onlinePeers.length > 0
+                      ? 'Pick someone online below for a 1-to-1 chat, or send a message here in Everyone Online.'
+                      : 'Share this site link with friends on any phone or browser. As soon as they enter their name, they will appear here.'}
                 </p>
               </div>
 
-              <div className="px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-mono text-slate-600 dark:text-slate-300 truncate">
-                {inviteUrl}
-              </div>
+              {!targetPeer && onlinePeers.length > 0 && (
+                <div className="pt-1 flex flex-wrap items-center justify-center gap-2">
+                  {onlinePeers.slice(0, 6).map((peer) => (
+                    <button
+                      key={peer.peerId}
+                      type="button"
+                      onClick={() =>
+                        onSelectChannel(getDmChannelId(localPeerId, peer.peerId))
+                      }
+                      className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:border-blue-600 dark:hover:border-blue-500 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                    >
+                      Message {peer.name}
+                    </button>
+                  ))}
+                </div>
+              )}
 
-              <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5 pt-1">
-                <button
-                  type="button"
-                  onClick={() => void handleCopyInvite()}
-                  className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium transition-colors whitespace-nowrap"
-                >
-                  {copiedInvite ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedInvite ? 'Copied' : 'Copy Invite Link'}</span>
-                </button>
+              {!targetPeer && onlinePeers.length === 0 && (
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyShare()}
+                    className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium transition-colors whitespace-nowrap"
+                  >
+                    {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedLink ? 'Copied' : 'Copy Site Link'}</span>
+                  </button>
 
-                <a
-                  href={inviteUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-medium transition-colors whitespace-nowrap"
-                >
-                  <ExternalLink className="w-3.5 h-3.5" />
-                  <span>Open Second Tab</span>
-                </a>
-              </div>
+                  <a
+                    href={secondTabUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-medium transition-colors whitespace-nowrap"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Open 2nd Account Tab</span>
+                  </a>
+                </div>
+              )}
             </div>
           </div>
         ) : (
@@ -301,7 +320,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     )}
 
                     <div
-                      className={`group max-w-[82%] sm:max-w-[70%] px-3.5 py-2.5 rounded-xl text-[15px] leading-relaxed whitespace-pre-wrap break-words ${
+                      className={`max-w-[82%] sm:max-w-[70%] px-3.5 py-2.5 rounded-xl text-[15px] leading-relaxed whitespace-pre-wrap break-words ${
                         isOwn
                           ? 'bg-blue-600 text-white'
                           : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-slate-100'
@@ -312,9 +331,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
                     <div className="mt-1 px-1 flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-slate-500 font-mono tabular-nums">
                       {isGrouped && <span>{formatTime(msg.timestamp)}</span>}
-                      {!isOwn && (
-                        <span>{transportText(msg.transport)}</span>
-                      )}
+                      {!isOwn && <span>{transportText(msg.transport)}</span>}
                       {isOwn && (
                         <span className="inline-flex items-center gap-1">
                           {msg.status === 'delivered' ? (

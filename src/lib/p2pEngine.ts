@@ -1,8 +1,7 @@
-import Gun from 'gun';
+import mqtt, { MqttClient } from 'mqtt';
 import {
   decryptPacket,
-  deriveRoomAesKey,
-  deriveRoomHash,
+  deriveAesKey,
   encryptPacket,
 } from './crypto';
 import {
@@ -13,11 +12,12 @@ import {
   WirePacket,
 } from '../types/chat';
 
-const GUN_RELAY_PEERS = [
-  'https://gun-manhattan.herokuapp.com/gun',
-  'https://peer.wallie.io/gun',
-  'https://relay.peer.ooo/gun',
+const BROKER_URLS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
 ];
+
+const TOPIC_PREFIX = 'varta/net/v2';
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -25,15 +25,15 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.cloudflare.com:3478' },
 ];
 
-const PEER_TTL_MS = 16000;
-const HEARTBEAT_INTERVAL_MS = 4000;
+const HEARTBEAT_MS = 12000;
+const PEER_TTL_MS = 45000;
 const TYPING_TTL_MS = 2600;
 
 export interface EngineCallbacks {
   onPeersChange: (peers: PeerInfo[]) => void;
   onMessageReceived: (message: ChatMessage) => void;
   onMessageAcked: (messageId: string) => void;
-  onRelayStatusChange: (connectedRelays: number) => void;
+  onConnectionStatusChange: (connected: boolean, brokerLabel: string) => void;
 }
 
 interface PeerConnectionEntry {
@@ -46,45 +46,25 @@ interface PeerConnectionEntry {
   remoteDescSet: boolean;
 }
 
-interface GunChain {
-  get: (key: string) => GunChain;
-  put: (data: Record<string, string | number | boolean>) => GunChain;
-  map: () => GunChain;
-  on: (cb: (data: unknown, key: string) => void) => void;
-  off: () => void;
-}
-
-interface GunInstance extends GunChain {
-  _?: {
-    opt?: {
-      peers?: Record<string, { wire?: WebSocket }>;
-    };
-  };
-}
-
 export class P2PChatEngine {
   private localPeerId: string;
   private localName: string;
-  private roomCode = '';
-  private roomHash = '';
-  private aesKey: CryptoKey | null = null;
   private callbacks: EngineCallbacks;
 
-  private gun: GunInstance | null = null;
-  private roomNode: GunChain | null = null;
+  private client: MqttClient | null = null;
   private broadcast: BroadcastChannel | null = null;
+  private aesKey: CryptoKey | null = null;
 
   private peers = new Map<string, PeerInfo>();
   private rtcEntries = new Map<string, PeerConnectionEntry>();
-  private manualEntries = new Map<string, PeerConnectionEntry>();
-
   private seenMessageIds = new Set<string>();
   private seenSignalIds = new Set<string>();
+
   private heartbeatTimer: number | null = null;
   private cleanupTimer: number | null = null;
-  private relayCheckTimer: number | null = null;
+  private failoverTimer: number | null = null;
+  private brokerIndex = 0;
   private destroyed = false;
-  private sessionStartTs = Date.now();
 
   constructor(
     localPeerId: string,
@@ -98,94 +78,51 @@ export class P2PChatEngine {
 
   public updateLocalName(name: string): void {
     this.localName = name;
-    this.broadcastPresence();
+    this.publishPresence();
   }
 
-  public seedSeenMessages(messages: ChatMessage[]): void {
-    for (const m of messages) {
-      this.seenMessageIds.add(m.id);
-    }
-  }
-
-  public async joinRoom(roomCode: string, existingMessages: ChatMessage[]): Promise<void> {
-    this.leaveRoom();
+  public async start(existingMessages: ChatMessage[]): Promise<void> {
+    this.stop();
     this.destroyed = false;
-    this.roomCode = roomCode.trim().toLowerCase();
-    this.sessionStartTs = Date.now();
     this.seenMessageIds.clear();
     this.seenSignalIds.clear();
-    this.seedSeenMessages(existingMessages);
+    for (const m of existingMessages) {
+      this.seenMessageIds.add(m.id);
+    }
 
-    const [roomHash, aesKey] = await Promise.all([
-      deriveRoomHash(this.roomCode),
-      deriveRoomAesKey(this.roomCode),
-    ]);
-
+    this.aesKey = await deriveAesKey('varta-global-network-key-v2');
     if (this.destroyed) return;
-    this.roomHash = roomHash;
-    this.aesKey = aesKey;
 
-    // 1. Instant same-device BroadcastChannel
+    // 1. Instant same-device BroadcastChannel (<1ms)
     if (typeof BroadcastChannel !== 'undefined') {
-      this.broadcast = new BroadcastChannel(`varta_mesh_${this.roomHash}`);
-      this.broadcast.onmessage = (event) => {
-        void this.handleBroadcastRaw(event.data);
+      this.broadcast = new BroadcastChannel('varta_global_mesh_v2');
+      this.broadcast.onmessage = (ev) => {
+        void this.handleBroadcastRaw(ev.data);
       };
     }
 
-    // 2. Decentralized Gun.js relay mesh (ephemeral in-memory; app data is saved in our structured localStorage)
-    try {
-      this.gun = Gun({
-        peers: GUN_RELAY_PEERS,
-        localStorage: false,
-        radisk: false,
-      }) as unknown as GunInstance;
+    // 2. Global WebSocket Relay + WebRTC Signaling
+    this.connectBroker(0);
 
-      this.roomNode = this.gun.get(`varta_v1_${this.roomHash}`);
-
-      // Listen for peer presence heartbeats
-      this.roomNode.get('presence').map().on((data: unknown, peerKey: string) => {
-        if (this.destroyed || !peerKey || peerKey === this.localPeerId) return;
-        if (!data || typeof data !== 'object') return;
-        const rec = data as { d?: string; ts?: number };
-        if (typeof rec.d !== 'string') return;
-        void this.handleEncryptedPresence(peerKey, rec.d);
-      });
-
-      // Listen for WebRTC signaling directed at this peer
-      this.roomNode.get('signals').get(this.localPeerId).map().on((data: unknown) => {
-        if (this.destroyed || !data || typeof data !== 'object') return;
-        const rec = data as { d?: string };
-        if (typeof rec.d !== 'string') return;
-        void this.handleEncryptedSignal(rec.d);
-      });
-
-      // Listen for encrypted Gun relay fallback packets
-      this.roomNode.get('packets').map().on((data: unknown) => {
-        if (this.destroyed || !data || typeof data !== 'object') return;
-        const rec = data as { d?: string; ts?: number };
-        if (typeof rec.d !== 'string') return;
-        void this.handleEncryptedWirePacket(rec.d, 'gun');
-      });
-
-      this.monitorRelayConnections();
-    } catch {
-      this.callbacks.onRelayStatusChange(0);
-    }
-
-    // 3. Start presence heartbeats and stale-peer reaper
-    this.broadcastPresence();
+    // 3. Periodic presence heartbeat & stale reaper
+    this.publishPresence();
     this.heartbeatTimer = window.setInterval(() => {
-      this.broadcastPresence();
-    }, HEARTBEAT_INTERVAL_MS);
+      this.publishPresence();
+    }, HEARTBEAT_MS);
 
     this.cleanupTimer = window.setInterval(() => {
       this.pruneStalePeers();
-    }, 3000);
+    }, 4000);
+
+    window.addEventListener('pagehide', this.handlePageUnload);
+    window.addEventListener('beforeunload', this.handlePageUnload);
   }
 
-  public leaveRoom(): void {
+  public stop(): void {
     this.destroyed = true;
+
+    window.removeEventListener('pagehide', this.handlePageUnload);
+    window.removeEventListener('beforeunload', this.handlePageUnload);
 
     if (this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
@@ -195,9 +132,20 @@ export class P2PChatEngine {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
     }
-    if (this.relayCheckTimer !== null) {
-      clearInterval(this.relayCheckTimer);
-      this.relayCheckTimer = null;
+    if (this.failoverTimer !== null) {
+      clearTimeout(this.failoverTimer);
+      this.failoverTimer = null;
+    }
+
+    this.clearMyPresence();
+
+    if (this.client) {
+      try {
+        this.client.end(true);
+      } catch {
+        // Ignore
+      }
+      this.client = null;
     }
 
     if (this.broadcast) {
@@ -209,27 +157,15 @@ export class P2PChatEngine {
       this.closeRtcEntry(entry);
     }
     this.rtcEntries.clear();
-
-    for (const entry of this.manualEntries.values()) {
-      this.closeRtcEntry(entry);
-    }
-    this.manualEntries.clear();
-
-    if (this.roomNode) {
-      try {
-        this.roomNode.off();
-      } catch {
-        // Ignore cleanup errors
-      }
-      this.roomNode = null;
-    }
-    this.gun = null;
     this.peers.clear();
     this.callbacks.onPeersChange([]);
-    this.callbacks.onRelayStatusChange(0);
+    this.callbacks.onConnectionStatusChange(false, 'Disconnected');
   }
 
-  public async sendMessage(message: Omit<ChatMessage, 'status' | 'transport'>, targetPeerId?: string): Promise<void> {
+  public async sendMessage(
+    message: Omit<ChatMessage, 'status' | 'transport'>,
+    targetPeerId?: string,
+  ): Promise<void> {
     this.seenMessageIds.add(message.id);
     const packet: WirePacket = {
       kind: 'chat',
@@ -238,7 +174,11 @@ export class P2PChatEngine {
     await this.dispatchWirePacket(packet, targetPeerId, true);
   }
 
-  public sendTyping(channelId: string, isTyping: boolean, targetPeerId?: string): void {
+  public sendTyping(
+    channelId: string,
+    isTyping: boolean,
+    targetPeerId?: string,
+  ): void {
     const packet: WirePacket = {
       kind: 'typing',
       peerId: this.localPeerId,
@@ -250,258 +190,170 @@ export class P2PChatEngine {
     void this.dispatchWirePacket(packet, targetPeerId, false);
   }
 
-  // --- Manual Offline / Firewalled WebRTC Pairing ---
+  private handlePageUnload = (): void => {
+    this.clearMyPresence();
+  };
 
-  public async createManualOffer(aliasLabel = 'Manual Peer'): Promise<string> {
-    const tempId = `manual_${Date.now().toString(36)}`;
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    const entry: PeerConnectionEntry = {
-      peerId: tempId,
-      pc,
-      dc: null,
-      makingOffer: false,
-      ignoreOffer: false,
-      pendingIce: [],
-      remoteDescSet: false,
-    };
-
-    const dc = pc.createDataChannel('varta-fast-dc', { ordered: true });
-    entry.dc = dc;
-    this.wireManualDataChannel(entry, dc, aliasLabel);
-    this.manualEntries.set(tempId, entry);
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await this.waitForIceGathering(pc, 2200);
-
-    const payload = {
-      t: 'offer',
-      p: this.localPeerId,
-      n: this.localName,
-      s: pc.localDescription,
-      k: tempId,
-    };
-    return btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
-  }
-
-  public async acceptManualOfferAndCreateAnswer(offerCode: string): Promise<string> {
-    const parsed = JSON.parse(decodeURIComponent(escape(atob(offerCode.trim())))) as {
-      t: string;
-      p: string;
-      n: string;
-      s: RTCSessionDescriptionInit;
-      k: string;
-    };
-
-    if (parsed.t !== 'offer' || !parsed.s) {
-      throw new Error('Invalid invite offer code');
-    }
-
-    const remotePeerId = parsed.p;
-    const remoteName = parsed.n || 'Direct Peer';
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    const entry: PeerConnectionEntry = {
-      peerId: remotePeerId,
-      pc,
-      dc: null,
-      makingOffer: false,
-      ignoreOffer: false,
-      pendingIce: [],
-      remoteDescSet: true,
-    };
-
-    pc.ondatachannel = (ev) => {
-      entry.dc = ev.channel;
-      this.wireManualDataChannel(entry, ev.channel, remoteName);
-    };
-
-    this.rtcEntries.set(remotePeerId, entry);
-    this.upsertPeer(remotePeerId, remoteName, false, 'connecting', false);
-
-    await pc.setRemoteDescription(parsed.s);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    await this.waitForIceGathering(pc, 2200);
-
-    const reply = {
-      t: 'answer',
-      p: this.localPeerId,
-      n: this.localName,
-      s: pc.localDescription,
-      k: parsed.k,
-    };
-    return btoa(unescape(encodeURIComponent(JSON.stringify(reply))));
-  }
-
-  public async acceptManualAnswer(answerCode: string): Promise<void> {
-    const parsed = JSON.parse(decodeURIComponent(escape(atob(answerCode.trim())))) as {
-      t: string;
-      p: string;
-      n: string;
-      s: RTCSessionDescriptionInit;
-      k: string;
-    };
-
-    if (parsed.t !== 'answer' || !parsed.s) {
-      throw new Error('Invalid response answer code');
-    }
-
-    const entry = this.manualEntries.get(parsed.k);
-    if (!entry) {
-      throw new Error('Pending offer session not found. Generate a fresh offer first.');
-    }
-
-    this.manualEntries.delete(parsed.k);
-    entry.peerId = parsed.p;
-    entry.remoteDescSet = true;
-    this.rtcEntries.set(parsed.p, entry);
-    this.upsertPeer(parsed.p, parsed.n || 'Direct Peer', false, 'connecting', false);
-
-    await entry.pc.setRemoteDescription(parsed.s);
-  }
-
-  private wireManualDataChannel(
-    entry: PeerConnectionEntry,
-    dc: RTCDataChannel,
-    fallbackName: string,
-  ): void {
-    entry.pc.onconnectionstatechange = () => {
-      const p = this.peers.get(entry.peerId);
-      if (p) {
-        p.webrtcState = entry.pc.connectionState;
-        p.lastSeen = Date.now();
-        this.emitPeers();
-      }
-    };
-
-    dc.onopen = () => {
-      const existing = this.peers.get(entry.peerId);
-      this.upsertPeer(
-        entry.peerId,
-        existing?.name ?? fallbackName,
-        false,
-        entry.pc.connectionState,
-        true,
-      );
-      const hello: WirePacket = {
-        kind: 'hello',
-        peerId: this.localPeerId,
-        name: this.localName,
-        timestamp: Date.now(),
-      };
-      dc.send(JSON.stringify(hello));
-    };
-
-    dc.onclose = () => {
-      const p = this.peers.get(entry.peerId);
-      if (p) {
-        p.dataChannelOpen = false;
-        p.webrtcState = 'disconnected';
-        this.emitPeers();
-      }
-    };
-
-    dc.onmessage = (ev) => {
-      if (typeof ev.data === 'string') {
-        try {
-          const pkt = JSON.parse(ev.data) as WirePacket;
-          this.handleWirePacket(pkt, 'webrtc');
-        } catch {
-          // Ignore malformed packet
-        }
-      }
-    };
-  }
-
-  private waitForIceGathering(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
-    if (pc.iceGatheringState === 'complete') return Promise.resolve();
-    return new Promise((resolve) => {
-      const timer = window.setTimeout(() => {
-        pc.removeEventListener('icegatheringstatechange', onState);
-        resolve();
-      }, timeoutMs);
-
-      const onState = () => {
-        if (pc.iceGatheringState === 'complete') {
-          clearTimeout(timer);
-          pc.removeEventListener('icegatheringstatechange', onState);
-          resolve();
-        }
-      };
-      pc.addEventListener('icegatheringstatechange', onState);
-    });
-  }
-
-  // --- Core Multi-Transport Dispatch ---
-
-  private async dispatchWirePacket(
-    packet: WirePacket,
-    targetPeerId: string | undefined,
-    includeGunFallback: boolean,
-  ): Promise<void> {
-    const serialized = JSON.stringify(packet);
-
-    // 1. Direct WebRTC DataChannels (fastest cross-device P2P path)
-    let sentViaDirectRtc = false;
-    if (targetPeerId) {
-      const entry = this.rtcEntries.get(targetPeerId);
-      if (entry?.dc && entry.dc.readyState === 'open') {
-        try {
-          entry.dc.send(serialized);
-          sentViaDirectRtc = true;
-        } catch {
-          // Fall back below
-        }
-      }
-    } else {
-      for (const entry of this.rtcEntries.values()) {
-        if (entry.dc && entry.dc.readyState === 'open') {
-          try {
-            entry.dc.send(serialized);
-            sentViaDirectRtc = true;
-          } catch {
-            // Continue other peers
-          }
-        }
-      }
-    }
-
-    // 2. Same-device BroadcastChannel (<1ms)
-    if (this.broadcast) {
+  private clearMyPresence(): void {
+    if (this.client?.connected) {
       try {
-        this.broadcast.postMessage({
-          kind: 'wire',
-          from: this.localPeerId,
-          packet,
+        this.client.publish(`${TOPIC_PREFIX}/users/${this.localPeerId}`, '', {
+          retain: true,
+          qos: 0,
         });
       } catch {
         // Ignore
       }
     }
-
-    // 3. Encrypted Gun.js Mesh Relay (always for chat if not all peers have direct RTC, or as reliable mesh sync)
-    if (this.roomNode && this.aesKey && (includeGunFallback || !sentViaDirectRtc)) {
+    if (this.broadcast) {
       try {
-        const cipher = await encryptPacket(this.aesKey, packet);
-        const nodeKey =
-          packet.kind === 'chat'
-            ? `m_${packet.message.id}`
-            : `e_${this.localPeerId}_${packet.kind}`;
-        this.roomNode.get('packets').get(nodeKey).put({
-          d: cipher,
-          ts: Date.now(),
+        this.broadcast.postMessage({
+          kind: 'leave',
+          peerId: this.localPeerId,
         });
       } catch {
-        // Ignore relay failure
+        // Ignore
       }
     }
   }
 
-  // --- Presence & Automatic WebRTC Negotiation ---
+  private connectBroker(index: number): void {
+    if (this.destroyed) return;
+    this.brokerIndex = index % BROKER_URLS.length;
+    const url = BROKER_URLS[this.brokerIndex];
+    const brokerLabel = url.includes('emqx') ? 'EMQX Mesh' : 'HiveMQ Mesh';
 
-  private broadcastPresence(): void {
+    if (this.client) {
+      try {
+        this.client.end(true);
+      } catch {
+        // Ignore
+      }
+      this.client = null;
+    }
+
+    if (this.failoverTimer !== null) {
+      clearTimeout(this.failoverTimer);
+      this.failoverTimer = null;
+    }
+
+    const client = mqtt.connect(url, {
+      clientId: `varta_${this.localPeerId}_${Math.random().toString(36).slice(2, 6)}`,
+      clean: true,
+      keepalive: 25,
+      reconnectPeriod: 4000,
+      connectTimeout: 6000,
+      will: {
+        topic: `${TOPIC_PREFIX}/users/${this.localPeerId}`,
+        payload: '',
+        qos: 0,
+        retain: true,
+      },
+    });
+
+    this.client = client;
+
+    // Failover to backup broker if primary does not connect within 6s
+    this.failoverTimer = window.setTimeout(() => {
+      if (!this.destroyed && !client.connected) {
+        this.connectBroker(this.brokerIndex + 1);
+      }
+    }, 6500);
+
+    client.on('connect', () => {
+      if (this.destroyed) return;
+      if (this.failoverTimer !== null) {
+        clearTimeout(this.failoverTimer);
+        this.failoverTimer = null;
+      }
+      this.callbacks.onConnectionStatusChange(true, brokerLabel);
+
+      client.subscribe(
+        [
+          `${TOPIC_PREFIX}/users/+`,
+          `${TOPIC_PREFIX}/inbox/${this.localPeerId}`,
+          `${TOPIC_PREFIX}/signal/${this.localPeerId}`,
+          `${TOPIC_PREFIX}/lounge`,
+        ],
+        { qos: 0 },
+      );
+
+      this.publishPresence();
+    });
+
+    client.on('offline', () => {
+      if (!this.destroyed) {
+        this.callbacks.onConnectionStatusChange(false, 'Reconnecting');
+      }
+    });
+
+    client.on('close', () => {
+      if (!this.destroyed) {
+        this.callbacks.onConnectionStatusChange(false, 'Reconnecting');
+      }
+    });
+
+    client.on('message', (topic, payloadBuf) => {
+      if (this.destroyed) return;
+      const raw = payloadBuf.toString();
+
+      if (topic.startsWith(`${TOPIC_PREFIX}/users/`)) {
+        const peerKey = topic.slice(`${TOPIC_PREFIX}/users/`.length);
+        if (!peerKey || peerKey === this.localPeerId) return;
+
+        if (!raw) {
+          this.peers.delete(peerKey);
+          this.emitPeers();
+          return;
+        }
+
+        try {
+          const data = JSON.parse(raw) as {
+            peerId?: string;
+            name?: string;
+            ts?: number;
+          };
+          if (!data.peerId || !data.name || typeof data.ts !== 'number') return;
+          if (Date.now() - data.ts > PEER_TTL_MS) return;
+
+          const existing = this.peers.get(data.peerId);
+          this.upsertPeer(
+            data.peerId,
+            data.name,
+            existing?.sameDevice ?? false,
+            existing?.webrtcState ?? 'idle',
+            existing?.dataChannelOpen ?? false,
+            data.ts,
+          );
+          this.maybeInitiateWebRTC(data.peerId);
+        } catch {
+          // Ignore invalid presence
+        }
+        return;
+      }
+
+      if (topic === `${TOPIC_PREFIX}/signal/${this.localPeerId}`) {
+        void this.handleEncryptedSignal(raw);
+        return;
+      }
+
+      if (
+        topic === `${TOPIC_PREFIX}/inbox/${this.localPeerId}` ||
+        topic === `${TOPIC_PREFIX}/lounge`
+      ) {
+        void this.handleEncryptedWirePacket(raw, 'relay');
+      }
+    });
+  }
+
+  private publishPresence(): void {
     if (this.destroyed) return;
     const now = Date.now();
+    const payload = JSON.stringify({
+      peerId: this.localPeerId,
+      name: this.localName,
+      ts: now,
+    });
 
     if (this.broadcast) {
       try {
@@ -516,49 +368,99 @@ export class P2PChatEngine {
       }
     }
 
-    if (this.roomNode && this.aesKey) {
-      void encryptPacket(this.aesKey, {
-        peerId: this.localPeerId,
-        name: this.localName,
-        ts: now,
-      }).then((cipher) => {
-        if (this.destroyed || !this.roomNode) return;
-        this.roomNode.get('presence').get(this.localPeerId).put({
-          d: cipher,
-          ts: now,
+    if (this.client?.connected) {
+      try {
+        this.client.publish(`${TOPIC_PREFIX}/users/${this.localPeerId}`, payload, {
+          retain: true,
+          qos: 0,
         });
-      });
+      } catch {
+        // Ignore
+      }
     }
   }
 
-  private async handleEncryptedPresence(peerKey: string, cipher: string): Promise<void> {
-    if (!this.aesKey) return;
-    const data = await decryptPacket<{ peerId: string; name: string; ts: number }>(
-      this.aesKey,
-      cipher,
-    );
-    if (!data || data.peerId !== peerKey) return;
-    if (Date.now() - data.ts > PEER_TTL_MS * 2) return;
+  private async dispatchWirePacket(
+    packet: WirePacket,
+    targetPeerId: string | undefined,
+    isChatMessage: boolean,
+  ): Promise<void> {
+    const serialized = JSON.stringify(packet);
 
-    const existing = this.peers.get(data.peerId);
-    this.upsertPeer(
-      data.peerId,
-      data.name,
-      existing?.sameDevice ?? false,
-      existing?.webrtcState ?? 'idle',
-      existing?.dataChannelOpen ?? false,
-    );
+    // 1. Direct WebRTC DataChannel (<10ms browser-to-browser)
+    let deliveredDirect = false;
+    if (targetPeerId) {
+      const entry = this.rtcEntries.get(targetPeerId);
+      if (entry?.dc && entry.dc.readyState === 'open') {
+        try {
+          entry.dc.send(serialized);
+          deliveredDirect = true;
+        } catch {
+          // Fallback to relay
+        }
+      }
+    } else {
+      for (const entry of this.rtcEntries.values()) {
+        if (entry.dc && entry.dc.readyState === 'open') {
+          try {
+            entry.dc.send(serialized);
+            deliveredDirect = true;
+          } catch {
+            // Continue
+          }
+        }
+      }
+    }
 
-    this.maybeInitiateWebRTC(data.peerId);
+    // 2. Same-device BroadcastChannel (<1ms)
+    if (this.broadcast) {
+      try {
+        this.broadcast.postMessage({
+          kind: 'wire',
+          from: this.localPeerId,
+          to: targetPeerId ?? null,
+          packet,
+        });
+      } catch {
+        // Ignore
+      }
+    }
+
+    // 3. Encrypted Ephemeral Relay (retain: false -> zero data stored on relay!)
+    if (this.client?.connected && this.aesKey) {
+      // For typing/acks when WebRTC direct is already open, skip relay if direct succeeded
+      if (!isChatMessage && deliveredDirect && targetPeerId) return;
+
+      try {
+        const cipher = await encryptPacket(this.aesKey, packet);
+        const topic = targetPeerId
+          ? `${TOPIC_PREFIX}/inbox/${targetPeerId}`
+          : `${TOPIC_PREFIX}/lounge`;
+        this.client.publish(topic, cipher, {
+          retain: false,
+          qos: isChatMessage ? 1 : 0,
+        });
+      } catch {
+        // Ignore
+      }
+    }
   }
 
   private async handleBroadcastRaw(raw: unknown): Promise<void> {
     if (this.destroyed || !raw || typeof raw !== 'object') return;
     const msg = raw as Record<string, unknown>;
 
+    if (msg.kind === 'leave') {
+      const peerId = String(msg.peerId ?? '');
+      if (peerId && this.peers.delete(peerId)) {
+        this.emitPeers();
+      }
+      return;
+    }
+
     if (msg.kind === 'presence') {
       const peerId = String(msg.peerId ?? '');
-      const name = String(msg.name ?? 'Peer');
+      const name = String(msg.name ?? 'User');
       if (!peerId || peerId === this.localPeerId) return;
       const existing = this.peers.get(peerId);
       this.upsertPeer(
@@ -567,6 +469,7 @@ export class P2PChatEngine {
         true,
         existing?.webrtcState ?? 'idle',
         existing?.dataChannelOpen ?? false,
+        Date.now(),
       );
       this.maybeInitiateWebRTC(peerId);
       return;
@@ -582,6 +485,7 @@ export class P2PChatEngine {
 
     if (msg.kind === 'wire') {
       if (msg.from === this.localPeerId) return;
+      if (msg.to && msg.to !== this.localPeerId) return;
       const pkt = msg.packet as WirePacket;
       if (pkt) {
         this.handleWirePacket(pkt, 'broadcast');
@@ -597,7 +501,10 @@ export class P2PChatEngine {
     await this.handleSignalPayload(sig);
   }
 
-  private async handleEncryptedWirePacket(cipher: string, transport: TransportKind): Promise<void> {
+  private async handleEncryptedWirePacket(
+    cipher: string,
+    transport: TransportKind,
+  ): Promise<void> {
     if (!this.aesKey) return;
     const pkt = await decryptPacket<WirePacket>(this.aesKey, cipher);
     if (!pkt) return;
@@ -612,8 +519,9 @@ export class P2PChatEngine {
         pkt.peerId,
         pkt.name,
         existing?.sameDevice ?? false,
-        existing?.webrtcState ?? 'connected',
+        'connected',
         true,
+        Date.now(),
       );
       return;
     }
@@ -624,6 +532,7 @@ export class P2PChatEngine {
       if (p) {
         p.name = pkt.name;
         p.lastSeen = Date.now();
+        p.typingChannelId = pkt.isTyping ? pkt.channelId : null;
         p.typingUntil = pkt.isTyping ? Date.now() + TYPING_TTL_MS : 0;
         this.emitPeers();
       }
@@ -640,9 +549,6 @@ export class P2PChatEngine {
       const m = pkt.message;
       if (m.senderId === this.localPeerId) return;
       if (this.seenMessageIds.has(m.id)) return;
-      // Skip stale ephemeral typing/replay older than room join unless loaded in localStorage
-      if (m.timestamp < this.sessionStartTs - 1000 * 60 * 60 * 12) return;
-
       this.seenMessageIds.add(m.id);
 
       const existing = this.peers.get(m.senderId);
@@ -652,12 +558,13 @@ export class P2PChatEngine {
         transport === 'broadcast' ? true : (existing?.sameDevice ?? false),
         existing?.webrtcState ?? 'idle',
         existing?.dataChannelOpen ?? false,
+        Date.now(),
       );
 
-      // Clear typing state on message receipt
       const peer = this.peers.get(m.senderId);
       if (peer) {
         peer.typingUntil = 0;
+        peer.typingChannelId = null;
         this.emitPeers();
       }
 
@@ -667,18 +574,17 @@ export class P2PChatEngine {
         transport,
       });
 
-      // Send real delivery ACK back to sender
       const ack: WirePacket = {
         kind: 'ack',
         messageId: m.id,
         fromPeerId: this.localPeerId,
         channelId: m.channelId,
       };
-      void this.dispatchWirePacket(ack, m.senderId, true);
+      void this.dispatchWirePacket(ack, m.senderId, false);
     }
   }
 
-  // --- WebRTC Polite/Impolite Negotiation ---
+  // --- Automatic WebRTC P2P Negotiation ---
 
   private maybeInitiateWebRTC(remotePeerId: string): void {
     if (this.destroyed || remotePeerId === this.localPeerId) return;
@@ -692,11 +598,9 @@ export class P2PChatEngine {
     }
 
     const entry = this.createPeerConnectionEntry(remotePeerId);
-    // Deterministic initiator: smaller peerId creates offer & DataChannel
     const isInitiator = this.localPeerId < remotePeerId;
-
     if (isInitiator) {
-      const dc = entry.pc.createDataChannel('varta-fast-dc', { ordered: true });
+      const dc = entry.pc.createDataChannel('varta-dm', { ordered: true });
       this.attachDataChannel(entry, dc);
       void this.negotiateOffer(entry);
     }
@@ -785,7 +689,7 @@ export class P2PChatEngine {
           const pkt = JSON.parse(ev.data) as WirePacket;
           this.handleWirePacket(pkt, 'webrtc');
         } catch {
-          // Ignore malformed packet
+          // Ignore
         }
       }
     };
@@ -807,7 +711,7 @@ export class P2PChatEngine {
         ts: Date.now(),
       });
     } catch {
-      // Ignore transient signaling error
+      // Ignore
     } finally {
       entry.makingOffer = false;
     }
@@ -819,7 +723,14 @@ export class P2PChatEngine {
 
     const existing = this.peers.get(sig.from);
     if (!existing) {
-      this.upsertPeer(sig.from, sig.fromName || 'Peer', false, 'connecting', false);
+      this.upsertPeer(
+        sig.from,
+        sig.fromName || 'User',
+        false,
+        'connecting',
+        false,
+        Date.now(),
+      );
     }
 
     let entry = this.rtcEntries.get(sig.from);
@@ -827,7 +738,6 @@ export class P2PChatEngine {
       entry = this.createPeerConnectionEntry(sig.from);
     }
 
-    // Polite peer is the one with larger peerId
     const polite = this.localPeerId > sig.from;
 
     try {
@@ -888,14 +798,13 @@ export class P2PChatEngine {
       }
     }
 
-    if (this.roomNode && this.aesKey) {
+    if (this.client?.connected && this.aesKey) {
       try {
         const cipher = await encryptPacket(this.aesKey, sig);
-        this.roomNode
-          .get('signals')
-          .get(sig.to)
-          .get(sig.id)
-          .put({ d: cipher, ts: sig.ts });
+        this.client.publish(`${TOPIC_PREFIX}/signal/${sig.to}`, cipher, {
+          retain: false,
+          qos: 0,
+        });
       } catch {
         // Ignore
       }
@@ -908,15 +817,17 @@ export class P2PChatEngine {
     sameDevice: boolean,
     webrtcState: RTCPeerConnectionState | 'idle',
     dataChannelOpen: boolean,
+    ts: number,
   ): void {
     const prev = this.peers.get(peerId);
     this.peers.set(peerId, {
       peerId,
-      name: name || prev?.name || 'Peer',
-      lastSeen: Date.now(),
+      name: name || prev?.name || 'User',
+      lastSeen: Math.max(ts, prev?.lastSeen ?? 0),
       webrtcState: dataChannelOpen ? 'connected' : webrtcState,
       dataChannelOpen,
       sameDevice: sameDevice || prev?.sameDevice || false,
+      typingChannelId: prev?.typingChannelId ?? null,
       typingUntil: prev?.typingUntil ?? 0,
     });
     this.emitPeers();
@@ -926,13 +837,12 @@ export class P2PChatEngine {
     const now = Date.now();
     let changed = false;
     for (const [id, peer] of this.peers.entries()) {
-      // Keep directly connected WebRTC peers alive even if Gun heartbeat pauses
-      if (peer.dataChannelOpen) continue;
-      if (now - peer.lastSeen > PEER_TTL_MS) {
+      if (!peer.dataChannelOpen && now - peer.lastSeen > PEER_TTL_MS) {
         this.peers.delete(id);
         changed = true;
       } else if (peer.typingUntil > 0 && now > peer.typingUntil) {
         peer.typingUntil = 0;
+        peer.typingChannelId = null;
         changed = true;
       }
     }
@@ -959,29 +869,5 @@ export class P2PChatEngine {
     } catch {
       // Ignore
     }
-  }
-
-  private monitorRelayConnections(): void {
-    const check = () => {
-      if (!this.gun || this.destroyed) return;
-      try {
-        const opt = (this.gun as unknown as { _: { opt?: { peers?: Record<string, { wire?: WebSocket }> } } })._?.opt?.peers;
-        if (!opt) {
-          this.callbacks.onRelayStatusChange(0);
-          return;
-        }
-        let connected = 0;
-        for (const p of Object.values(opt)) {
-          if (p?.wire && p.wire.readyState === 1) {
-            connected++;
-          }
-        }
-        this.callbacks.onRelayStatusChange(connected);
-      } catch {
-        this.callbacks.onRelayStatusChange(0);
-      }
-    };
-    check();
-    this.relayCheckTimer = window.setInterval(check, 3000);
   }
 }

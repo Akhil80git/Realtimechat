@@ -1,44 +1,37 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChatArea } from './components/ChatArea';
-import { ManualPairModal } from './components/ManualPairModal';
 import { OnboardingView } from './components/OnboardingView';
 import { Sidebar } from './components/Sidebar';
 import { generatePeerId, getDmChannelId } from './lib/crypto';
 import { P2PChatEngine } from './lib/p2pEngine';
 import {
   clearAllLocalData,
-  clearRoomMessages,
+  clearChannelMessages,
   exportAllLocalData,
   getStorageStats,
+  loadAllMessages,
   loadContacts,
-  loadMessages,
   loadProfile,
-  loadRooms,
-  saveMessages,
+  saveAllMessages,
   saveProfile,
-  saveRoom,
-  StoredContact,
   upsertContact,
 } from './lib/storage';
 import {
   ChatMessage,
   PeerInfo,
-  RoomMeta,
   StorageStats,
+  StoredContact,
   UserProfile,
 } from './types/chat';
 
-function getInitialUrlParams(): { room: string; isNewTabIdentity: boolean } {
+function isNewTabAccountMode(): boolean {
   const params = new URLSearchParams(window.location.search);
-  const rawRoom = params.get('room') ?? 'lobby';
-  const cleanRoom = rawRoom.trim().toLowerCase().replace(/[^a-z0-9-_]/g, '') || 'lobby';
-  const isNewTabIdentity = params.get('as') === 'new';
-  return { room: cleanRoom, isNewTabIdentity };
+  return params.get('as') === 'new';
 }
 
 function loadSessionProfileOverride(): UserProfile | null {
   try {
-    const raw = sessionStorage.getItem('varta_session_profile');
+    const raw = sessionStorage.getItem('varta_session_account_v2');
     return raw ? (JSON.parse(raw) as UserProfile) : null;
   } catch {
     return null;
@@ -47,19 +40,19 @@ function loadSessionProfileOverride(): UserProfile | null {
 
 function saveSessionProfileOverride(profile: UserProfile): void {
   try {
-    sessionStorage.setItem('varta_session_profile', JSON.stringify(profile));
+    sessionStorage.setItem('varta_session_account_v2', JSON.stringify(profile));
   } catch {
     // Ignore
   }
 }
 
 export default function App() {
-  const initialParams = useMemo(() => getInitialUrlParams(), []);
+  const newTabMode = useMemo(() => isNewTabAccountMode(), []);
 
   const [profile, setProfile] = useState<UserProfile | null>(() => {
     const sessionOverride = loadSessionProfileOverride();
     if (sessionOverride) return sessionOverride;
-    if (initialParams.isNewTabIdentity) return null;
+    if (newTabMode) return null;
     return loadProfile();
   });
 
@@ -71,31 +64,27 @@ export default function App() {
       : 'light';
   });
 
-  const [activeRoom, setActiveRoom] = useState<string>(initialParams.room);
-  const [activeChannelId, setActiveChannelId] = useState<string>('room');
-  const [rooms, setRooms] = useState<RoomMeta[]>(() => loadRooms());
-  const [messages, setMessages] = useState<ChatMessage[]>(() =>
-    loadMessages(initialParams.room),
-  );
+  const [activeChannelId, setActiveChannelId] = useState<string>('lounge');
+  const [messages, setMessages] = useState<ChatMessage[]>(() => loadAllMessages());
   const [onlinePeers, setOnlinePeers] = useState<PeerInfo[]>([]);
   const [savedContacts, setSavedContacts] = useState<StoredContact[]>(() =>
     loadContacts(),
   );
+  const [unreadByChannel, setUnreadByChannel] = useState<Record<string, number>>({});
   const [storageStats, setStorageStats] = useState<StorageStats>(() =>
     getStorageStats(),
   );
-  const [connectedRelays, setConnectedRelays] = useState<number>(0);
+  const [meshConnected, setMeshConnected] = useState<boolean>(false);
+  const [meshLabel, setMeshLabel] = useState<string>('Connecting...');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState<boolean>(false);
-  const [manualPairOpen, setManualPairOpen] = useState<boolean>(false);
 
   const engineRef = useRef<P2PChatEngine | null>(null);
   const messagesRef = useRef<ChatMessage[]>(messages);
   messagesRef.current = messages;
 
-  const activeRoomRef = useRef<string>(activeRoom);
-  activeRoomRef.current = activeRoom;
+  const activeChannelRef = useRef<string>(activeChannelId);
+  activeChannelRef.current = activeChannelId;
 
-  // Sync Tailwind dark class on <html>
   useEffect(() => {
     const root = document.documentElement;
     if (theme === 'dark') {
@@ -109,62 +98,48 @@ export default function App() {
     setStorageStats(getStorageStats());
   }, []);
 
-  const syncRoomQueryParam = useCallback((roomCode: string) => {
-    const url = new URL(window.location.href);
-    url.searchParams.set('room', roomCode);
-    url.searchParams.delete('as');
-    window.history.replaceState({}, '', url.toString());
-  }, []);
-
-  // Initialize and manage P2P Engine when profile & activeRoom are ready
   useEffect(() => {
     if (!profile) return;
 
-    const currentMsgs = loadMessages(activeRoom);
+    const currentMsgs = loadAllMessages();
     setMessages(currentMsgs);
-    setRooms(saveRoom(activeRoom));
     refreshStats();
-    syncRoomQueryParam(activeRoom);
 
     const engine = new P2PChatEngine(profile.peerId, profile.name, {
       onPeersChange: (peers) => {
         setOnlinePeers(peers);
         for (const p of peers) {
-          setSavedContacts(upsertContact(p, activeRoomRef.current));
+          setSavedContacts(upsertContact(p.peerId, p.name, p.lastSeen));
         }
       },
       onMessageReceived: (incoming) => {
-        const room = activeRoomRef.current;
-        if (incoming.roomCode !== room) return;
-
         setMessages((prev) => {
           if (prev.some((m) => m.id === incoming.id)) return prev;
           const next = [...prev, incoming].sort((a, b) => a.timestamp - b.timestamp);
-          saveMessages(room, next);
+          saveAllMessages(next);
           return next;
         });
 
-        setRooms(
-          saveRoom(
-            room,
-            `${incoming.senderName}: ${incoming.text.slice(0, 48)}`,
+        setSavedContacts(
+          upsertContact(
+            incoming.senderId,
+            incoming.senderName,
+            incoming.timestamp,
+            incoming.text.slice(0, 48),
             incoming.timestamp,
           ),
         );
-        setSavedContacts(
-          upsertContact(
-            {
-              peerId: incoming.senderId,
-              name: incoming.senderName,
-              lastSeen: incoming.timestamp,
-            },
-            room,
-          ),
-        );
+
+        if (activeChannelRef.current !== incoming.channelId) {
+          setUnreadByChannel((prev) => ({
+            ...prev,
+            [incoming.channelId]: (prev[incoming.channelId] ?? 0) + 1,
+          }));
+        }
+
         refreshStats();
       },
       onMessageAcked: (messageId) => {
-        const room = activeRoomRef.current;
         setMessages((prev) => {
           let changed = false;
           const next = prev.map((m) => {
@@ -175,26 +150,26 @@ export default function App() {
             return m;
           });
           if (changed) {
-            saveMessages(room, next);
+            saveAllMessages(next);
           }
           return changed ? next : prev;
         });
       },
-      onRelayStatusChange: (count) => {
-        setConnectedRelays(count);
+      onConnectionStatusChange: (connected, label) => {
+        setMeshConnected(connected);
+        setMeshLabel(label);
       },
     });
 
     engineRef.current = engine;
-    void engine.joinRoom(activeRoom, currentMsgs);
+    void engine.start(currentMsgs);
 
     return () => {
-      engine.leaveRoom();
+      engine.stop();
       engineRef.current = null;
     };
-  }, [profile?.peerId, activeRoom, refreshStats, syncRoomQueryParam]);
+  }, [profile?.peerId, refreshStats]);
 
-  // Keep engine name synced without tearing down connections
   useEffect(() => {
     if (profile && engineRef.current) {
       engineRef.current.updateLocalName(profile.name);
@@ -207,7 +182,7 @@ export default function App() {
     if (profile) {
       const updated: UserProfile = { ...profile, theme: nextTheme };
       setProfile(updated);
-      if (initialParams.isNewTabIdentity || loadSessionProfileOverride()) {
+      if (newTabMode || loadSessionProfileOverride()) {
         saveSessionProfileOverride(updated);
       } else {
         saveProfile(updated);
@@ -215,7 +190,7 @@ export default function App() {
     }
   };
 
-  const handleCompleteOnboarding = (name: string, roomCode: string) => {
+  const handleCompleteOnboarding = (name: string) => {
     const newProfile: UserProfile = {
       peerId: generatePeerId(),
       name,
@@ -223,14 +198,13 @@ export default function App() {
       createdAt: Date.now(),
     };
 
-    if (initialParams.isNewTabIdentity) {
+    if (newTabMode) {
       saveSessionProfileOverride(newProfile);
     } else {
       saveProfile(newProfile);
     }
 
-    setActiveRoom(roomCode);
-    setActiveChannelId('room');
+    setActiveChannelId('lounge');
     setProfile(newProfile);
   };
 
@@ -238,22 +212,25 @@ export default function App() {
     if (!profile) return;
     const updated: UserProfile = { ...profile, name };
     setProfile(updated);
-    if (initialParams.isNewTabIdentity || loadSessionProfileOverride()) {
+    if (newTabMode || loadSessionProfileOverride()) {
       saveSessionProfileOverride(updated);
     } else {
       saveProfile(updated);
     }
   };
 
-  const handleSwitchRoom = (roomCode: string) => {
-    const clean = roomCode.trim().toLowerCase();
-    if (!clean || clean === activeRoom) return;
-    setActiveRoom(clean);
-    setActiveChannelId('room');
+  const handleSelectChannel = (channelId: string) => {
+    setActiveChannelId(channelId);
+    setUnreadByChannel((prev) => {
+      if (!prev[channelId]) return prev;
+      const next = { ...prev };
+      delete next[channelId];
+      return next;
+    });
   };
 
   const targetPeer = useMemo(() => {
-    if (!profile || activeChannelId === 'room') return null;
+    if (!profile || activeChannelId === 'lounge') return null;
     return (
       onlinePeers.find(
         (p) => getDmChannelId(profile.peerId, p.peerId) === activeChannelId,
@@ -261,29 +238,34 @@ export default function App() {
     );
   }, [activeChannelId, onlinePeers, profile]);
 
-  const channelTitle = useMemo(() => {
-    if (activeChannelId === 'room') return `# ${activeRoom}`;
-    if (targetPeer) return `@ ${targetPeer.name}`;
-    if (profile) {
-      const offline = savedContacts.find(
+  const targetSavedContact = useMemo(() => {
+    if (!profile || activeChannelId === 'lounge') return null;
+    return (
+      savedContacts.find(
         (c) => getDmChannelId(profile.peerId, c.peerId) === activeChannelId,
-      );
-      if (offline) return `@ ${offline.name}`;
-    }
+      ) ?? null
+    );
+  }, [activeChannelId, profile, savedContacts]);
+
+  const channelTitle = useMemo(() => {
+    if (activeChannelId === 'lounge') return 'Everyone Online';
+    if (targetPeer) return targetPeer.name;
+    if (targetSavedContact) return targetSavedContact.name;
     return 'Direct Message';
-  }, [activeChannelId, activeRoom, profile, savedContacts, targetPeer]);
+  }, [activeChannelId, targetPeer, targetSavedContact]);
 
   const handleSendMessage = (text: string) => {
     if (!profile) return;
     const msgId = `${profile.peerId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const now = Date.now();
+    const recipientId = targetPeer?.peerId ?? targetSavedContact?.peerId;
 
     const outbound: ChatMessage = {
       id: msgId,
-      roomCode: activeRoom,
       channelId: activeChannelId,
       senderId: profile.peerId,
       senderName: profile.name,
+      recipientId,
       text,
       timestamp: now,
       status: 'sent',
@@ -292,48 +274,39 @@ export default function App() {
 
     const nextMessages = [...messagesRef.current, outbound];
     setMessages(nextMessages);
-    saveMessages(activeRoom, nextMessages);
-    setRooms(saveRoom(activeRoom, `You: ${text.slice(0, 48)}`, now));
+    saveAllMessages(nextMessages);
+
+    if (recipientId) {
+      const recipientName = targetPeer?.name ?? targetSavedContact?.name ?? 'User';
+      setSavedContacts(
+        upsertContact(recipientId, recipientName, now, `You: ${text.slice(0, 48)}`, now),
+      );
+    }
+
     refreshStats();
 
     void engineRef.current?.sendMessage(
       {
         id: outbound.id,
-        roomCode: outbound.roomCode,
         channelId: outbound.channelId,
         senderId: outbound.senderId,
         senderName: outbound.senderName,
+        recipientId: outbound.recipientId,
         text: outbound.text,
         timestamp: outbound.timestamp,
       },
-      targetPeer?.peerId,
+      recipientId,
     );
   };
 
   const handleTypingChange = (isTyping: boolean) => {
-    engineRef.current?.sendTyping(
-      activeChannelId,
-      isTyping,
-      targetPeer?.peerId,
-    );
+    const recipientId = targetPeer?.peerId ?? targetSavedContact?.peerId;
+    engineRef.current?.sendTyping(activeChannelId, isTyping, recipientId);
   };
 
   const handleClearChannel = () => {
-    if (activeChannelId === 'room') {
-      const remaining = messagesRef.current.filter((m) => m.channelId !== 'room');
-      if (remaining.length === 0) {
-        clearRoomMessages(activeRoom);
-      } else {
-        saveMessages(activeRoom, remaining);
-      }
-      setMessages(remaining);
-    } else {
-      const remaining = messagesRef.current.filter(
-        (m) => m.channelId !== activeChannelId,
-      );
-      saveMessages(activeRoom, remaining);
-      setMessages(remaining);
-    }
+    const remaining = clearChannelMessages(activeChannelId);
+    setMessages(remaining);
     refreshStats();
   };
 
@@ -349,32 +322,40 @@ export default function App() {
   };
 
   const handleClearAllData = () => {
-    engineRef.current?.leaveRoom();
-    clearAllLocalData();
+    engineRef.current?.stop();
+    if (!newTabMode) {
+      clearAllLocalData();
+    }
     try {
-      sessionStorage.removeItem('varta_session_profile');
+      sessionStorage.removeItem('varta_session_account_v2');
     } catch {
       // Ignore
     }
-    setMessages([]);
-    setRooms([]);
-    setSavedContacts([]);
+    setMessages(newTabMode ? loadAllMessages() : []);
+    setSavedContacts(newTabMode ? loadContacts() : []);
     setOnlinePeers([]);
+    setUnreadByChannel({});
     setProfile(null);
     refreshStats();
   };
 
-  const inviteUrl = useMemo(() => {
+  const shareUrl = useMemo(() => {
     const url = new URL(window.location.href);
-    url.searchParams.set('room', activeRoom);
+    url.searchParams.delete('as');
+    url.searchParams.delete('room');
+    return url.toString();
+  }, []);
+
+  const secondTabUrl = useMemo(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('room');
     url.searchParams.set('as', 'new');
     return url.toString();
-  }, [activeRoom]);
+  }, []);
 
   if (!profile) {
     return (
       <OnboardingView
-        initialRoom={activeRoom}
         theme={theme}
         onToggleTheme={handleToggleTheme}
         onComplete={handleCompleteOnboarding}
@@ -386,19 +367,19 @@ export default function App() {
     <div className="h-screen w-screen overflow-hidden flex bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
       <Sidebar
         profile={profile}
-        activeRoom={activeRoom}
         activeChannelId={activeChannelId}
-        rooms={rooms}
         onlinePeers={onlinePeers}
         savedContacts={savedContacts}
+        unreadByChannel={unreadByChannel}
         storageStats={storageStats}
-        connectedRelays={connectedRelays}
+        meshConnected={meshConnected}
+        meshLabel={meshLabel}
+        secondTabUrl={secondTabUrl}
         isOpenMobile={mobileSidebarOpen}
         onCloseMobile={() => setMobileSidebarOpen(false)}
         onUpdateName={handleUpdateName}
         onToggleTheme={handleToggleTheme}
-        onSelectChannel={setActiveChannelId}
-        onSwitchRoom={handleSwitchRoom}
+        onSelectChannel={handleSelectChannel}
         onExportData={handleExportData}
         onClearAllData={handleClearAllData}
       />
@@ -406,41 +387,18 @@ export default function App() {
       <ChatArea
         localPeerId={profile.peerId}
         localName={profile.name}
-        activeRoom={activeRoom}
         activeChannelId={activeChannelId}
         channelTitle={channelTitle}
         targetPeer={targetPeer}
         onlinePeers={onlinePeers}
         messages={messages}
-        inviteUrl={inviteUrl}
+        shareUrl={shareUrl}
+        secondTabUrl={secondTabUrl}
         onOpenMobileSidebar={() => setMobileSidebarOpen(true)}
-        onOpenManualPair={() => setManualPairOpen(true)}
+        onSelectChannel={handleSelectChannel}
         onSendMessage={handleSendMessage}
         onTypingChange={handleTypingChange}
         onClearChannel={handleClearChannel}
-      />
-
-      <ManualPairModal
-        isOpen={manualPairOpen}
-        onClose={() => setManualPairOpen(false)}
-        onCreateOffer={() => {
-          if (!engineRef.current) {
-            return Promise.reject(new Error('Chat engine not ready'));
-          }
-          return engineRef.current.createManualOffer();
-        }}
-        onAcceptOfferCreateAnswer={(offer) => {
-          if (!engineRef.current) {
-            return Promise.reject(new Error('Chat engine not ready'));
-          }
-          return engineRef.current.acceptManualOfferAndCreateAnswer(offer);
-        }}
-        onAcceptAnswer={(answer) => {
-          if (!engineRef.current) {
-            return Promise.reject(new Error('Chat engine not ready'));
-          }
-          return engineRef.current.acceptManualAnswer(answer);
-        }}
       />
     </div>
   );
