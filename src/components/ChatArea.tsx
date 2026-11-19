@@ -31,6 +31,8 @@ import {
   prepareMediaAttachment,
 } from '../lib/media';
 import { getMediaObjectUrl } from '../lib/mediaVault';
+import { OfflineIndicator } from './OfflineIndicator';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface ChatAreaProps {
   localPeerId: string;
@@ -628,6 +630,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          <PWAInstallButton variant="header" />
+
           <button
             type="button"
             onClick={() => {
@@ -665,6 +669,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           </button>
         </div>
       </header>
+
+      <OfflineIndicator />
 
       {/* Optional In-Chat Search Bar */}
       {searchOpen && (

@@ -15,6 +15,7 @@ import {
 import { PeerInfo, StorageStats, StoredContact, UserProfile } from '../types/chat';
 import { findUsernameConflict, getDmChannelId } from '../lib/crypto';
 import { formatFileSize } from '../lib/media';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface SidebarProps {
   profile: UserProfile;
@@ -393,6 +394,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       {/* Private Site Storage Footer (Delete-Only, No Export) */}
       <div className="px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] border-t border-slate-200 dark:border-slate-800 space-y-2.5 bg-slate-50/70 dark:bg-slate-900 shrink-0">
+        <PWAInstallButton variant="sidebar" />
+
         <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
           <span>In-Site Storage</span>
           <span className="font-mono tabular-nums">
