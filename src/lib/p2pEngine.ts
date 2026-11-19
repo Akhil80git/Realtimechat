@@ -4,9 +4,18 @@ import {
   deriveAesKey,
   encryptPacket,
 } from './crypto';
-import { saveMediaBlob } from './mediaVault';
+import { getMediaBlob, saveMediaBlob } from './mediaVault';
+import {
+  enqueueOutboxItem,
+  getOutboxForPeer,
+  loadContacts,
+  loadDeletedMessageIds,
+  removeOutboxByOpId,
+  removeOutboxChatByMessageId,
+} from './storage';
 import {
   ChatMessage,
+  OutboxItem,
   PeerInfo,
   SignalPayload,
   TransportKind,
@@ -31,6 +40,7 @@ const PEER_TTL_MS = 45000;
 const TYPING_TTL_MS = 2600;
 const MEDIA_CHUNK_BYTES = 28 * 1024;
 const TRANSFER_TTL_MS = 1000 * 60 * 10;
+const FLUSH_COOLDOWN_MS = 2500;
 
 export interface EngineCallbacks {
   onPeersChange: (peers: PeerInfo[]) => void;
@@ -45,7 +55,7 @@ export interface EngineCallbacks {
     add: boolean,
   ) => void;
   onMessageDeleted: (channelId: string, messageId: string) => void;
-  onChannelCleared: (channelId: string) => void;
+  onChannelCleared: (channelId: string, clearedAt?: number) => void;
   onConnectionStatusChange: (connected: boolean, brokerLabel: string) => void;
 }
 
@@ -60,6 +70,7 @@ interface PeerConnectionEntry {
 }
 
 interface IncomingMediaTransfer {
+  opId?: string;
   message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
   totalChunks: number;
   chunks: (Uint8Array | undefined)[];
@@ -100,7 +111,11 @@ export class P2PChatEngine {
   private rtcEntries = new Map<string, PeerConnectionEntry>();
   private seenMessageIds = new Set<string>();
   private seenSignalIds = new Set<string>();
+  private seenOpIds = new Set<string>();
   private incomingTransfers = new Map<string, IncomingMediaTransfer>();
+
+  private flushingPeers = new Set<string>();
+  private lastFlushAt = new Map<string, number>();
 
   private heartbeatTimer: number | null = null;
   private cleanupTimer: number | null = null;
@@ -128,7 +143,11 @@ export class P2PChatEngine {
     this.destroyed = false;
     this.seenMessageIds.clear();
     this.seenSignalIds.clear();
+    this.seenOpIds.clear();
     this.incomingTransfers.clear();
+    this.flushingPeers.clear();
+    this.lastFlushAt.clear();
+
     for (const m of existingMessages) {
       this.seenMessageIds.add(m.id);
     }
@@ -149,6 +168,8 @@ export class P2PChatEngine {
 
     // 3. Periodic presence heartbeat & stale reaper
     this.publishPresence();
+    this.sendSyncHello();
+
     this.heartbeatTimer = window.setInterval(() => {
       this.publishPresence();
     }, HEARTBEAT_MS);
@@ -159,6 +180,7 @@ export class P2PChatEngine {
 
     window.addEventListener('pagehide', this.handlePageUnload);
     window.addEventListener('beforeunload', this.handlePageUnload);
+    window.addEventListener('online', this.handleNetworkOnline);
   }
 
   public stop(): void {
@@ -166,6 +188,7 @@ export class P2PChatEngine {
 
     window.removeEventListener('pagehide', this.handlePageUnload);
     window.removeEventListener('beforeunload', this.handlePageUnload);
+    window.removeEventListener('online', this.handleNetworkOnline);
 
     if (this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
@@ -206,27 +229,74 @@ export class P2PChatEngine {
     this.callbacks.onConnectionStatusChange(false, 'Disconnected');
   }
 
+  private getTargetPeerIds(explicitTargetId?: string): string[] {
+    if (explicitTargetId) return [explicitTargetId];
+    const ids = new Set<string>();
+    for (const p of this.peers.keys()) {
+      if (p !== this.localPeerId) ids.add(p);
+    }
+    for (const c of loadContacts()) {
+      if (c.peerId !== this.localPeerId) ids.add(c.peerId);
+    }
+    return Array.from(ids);
+  }
+
   public async sendMessage(
     message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>,
     mediaBlob?: Blob,
     targetPeerId?: string,
   ): Promise<void> {
     this.seenMessageIds.add(message.id);
+    const now = Date.now();
 
+    // Persist in sender's localStorage outbox for every target so offline peers sync on reconnect
+    const targets = this.getTargetPeerIds(targetPeerId);
+    for (const tid of targets) {
+      enqueueOutboxItem({
+        opId: `op_${message.id}_${tid}`,
+        targetPeerId: tid,
+        kind: 'chat',
+        channelId: message.channelId,
+        createdAt: now,
+        message: {
+          ...message,
+          attachment: message.attachment
+            ? { ...message.attachment, dataUrl: undefined }
+            : undefined,
+        },
+      });
+    }
+
+    // If a specific DM recipient is currently offline, keep safely in outbox until they reconnect
+    if (targetPeerId && !this.peers.has(targetPeerId) && mediaBlob) {
+      this.callbacks.onMediaTransferProgress(message.id, undefined);
+      return;
+    }
+
+    const opId = targetPeerId ? `op_${message.id}_${targetPeerId}` : undefined;
+    await this.transmitChatMessage(message, mediaBlob, targetPeerId, opId, true);
+  }
+
+  private async transmitChatMessage(
+    message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>,
+    mediaBlob: Blob | undefined,
+    targetPeerId: string | undefined,
+    opId: string | undefined,
+    reportProgress: boolean,
+  ): Promise<void> {
     if (!mediaBlob) {
       const packet: WirePacket = {
         kind: 'chat',
+        opId,
         message,
       };
       await this.dispatchWirePacket(packet, targetPeerId, true);
       return;
     }
 
-    // Unlimited-size chunked media streaming (works for any image, video, audio, or file)
     const totalChunks = Math.max(1, Math.ceil(mediaBlob.size / MEDIA_CHUNK_BYTES));
-    const transferId = `tr_${message.id}`;
+    const transferId = `tr_${message.id}_${targetPeerId ?? 'all'}`;
 
-    // Strip any inline dataUrl before wire dispatch; receiver rebuilds Blob from chunks
     const cleanMetaMessage = {
       ...message,
       attachment: message.attachment
@@ -236,6 +306,7 @@ export class P2PChatEngine {
 
     const metaPacket: WirePacket = {
       kind: 'media-meta',
+      opId,
       transferId,
       totalChunks,
       message: cleanMetaMessage,
@@ -259,7 +330,6 @@ export class P2PChatEngine {
         data: b64,
       };
 
-      // Backpressure guard for direct WebRTC channel on very large videos/files
       if (targetPeerId) {
         const entry = this.rtcEntries.get(targetPeerId);
         if (entry?.dc && entry.dc.readyState === 'open' && entry.dc.bufferedAmount > 512 * 1024) {
@@ -269,13 +339,15 @@ export class P2PChatEngine {
 
       await this.dispatchWirePacket(chunkPacket, targetPeerId, true);
 
-      const pct = Math.round(((i + 1) / totalChunks) * 100);
-      if (pct !== lastPct && (pct % 5 === 0 || i === totalChunks - 1)) {
-        lastPct = pct;
-        this.callbacks.onMediaTransferProgress(
-          message.id,
-          i === totalChunks - 1 ? undefined : pct,
-        );
+      if (reportProgress) {
+        const pct = Math.round(((i + 1) / totalChunks) * 100);
+        if (pct !== lastPct && (pct % 5 === 0 || i === totalChunks - 1)) {
+          lastPct = pct;
+          this.callbacks.onMediaTransferProgress(
+            message.id,
+            i === totalChunks - 1 ? undefined : pct,
+          );
+        }
       }
 
       if (i % 4 === 3) {
@@ -291,8 +363,25 @@ export class P2PChatEngine {
     add: boolean,
     targetPeerId?: string,
   ): void {
+    const now = Date.now();
+    const targets = this.getTargetPeerIds(targetPeerId);
+    for (const tid of targets) {
+      const opId = `op_react_${messageId}_${emoji}_${tid}_${now}`;
+      enqueueOutboxItem({
+        opId,
+        targetPeerId: tid,
+        kind: 'reaction',
+        channelId,
+        createdAt: now,
+        messageId,
+        emoji,
+        add,
+      });
+    }
+
     const packet: WirePacket = {
       kind: 'reaction',
+      opId: targetPeerId ? `op_react_${messageId}_${emoji}_${targetPeerId}_${now}` : undefined,
       channelId,
       messageId,
       emoji,
@@ -307,8 +396,23 @@ export class P2PChatEngine {
     messageId: string,
     targetPeerId?: string,
   ): void {
+    const now = Date.now();
+    const targets = this.getTargetPeerIds(targetPeerId);
+    for (const tid of targets) {
+      const opId = `op_del_${messageId}_${tid}`;
+      enqueueOutboxItem({
+        opId,
+        targetPeerId: tid,
+        kind: 'delete-msg',
+        channelId,
+        createdAt: now,
+        messageId,
+      });
+    }
+
     const packet: WirePacket = {
       kind: 'delete-msg',
+      opId: targetPeerId ? `op_del_${messageId}_${targetPeerId}` : undefined,
       channelId,
       messageId,
       fromPeerId: this.localPeerId,
@@ -317,9 +421,24 @@ export class P2PChatEngine {
   }
 
   public sendClearChat(channelId: string, targetPeerId?: string): void {
+    const now = Date.now();
+    const targets = this.getTargetPeerIds(targetPeerId);
+    for (const tid of targets) {
+      const opId = `op_clr_${channelId}_${tid}_${now}`;
+      enqueueOutboxItem({
+        opId,
+        targetPeerId: tid,
+        kind: 'clear-chat',
+        channelId,
+        createdAt: now,
+      });
+    }
+
     const packet: WirePacket = {
       kind: 'clear-chat',
+      opId: targetPeerId ? `op_clr_${channelId}_${targetPeerId}_${now}` : undefined,
       channelId,
+      clearedAt: now,
       fromPeerId: this.localPeerId,
     };
     void this.dispatchWirePacket(packet, targetPeerId, true);
@@ -340,6 +459,117 @@ export class P2PChatEngine {
     };
     void this.dispatchWirePacket(packet, targetPeerId, false);
   }
+
+  private async flushOutboxForPeer(remotePeerId: string, force = false): Promise<void> {
+    if (this.destroyed || remotePeerId === this.localPeerId) return;
+    if (this.flushingPeers.has(remotePeerId)) return;
+
+    const lastAt = this.lastFlushAt.get(remotePeerId) ?? 0;
+    if (!force && Date.now() - lastAt < FLUSH_COOLDOWN_MS) return;
+
+    const pending = getOutboxForPeer(remotePeerId);
+    if (pending.length === 0) return;
+
+    this.flushingPeers.add(remotePeerId);
+    this.lastFlushAt.set(remotePeerId, Date.now());
+
+    try {
+      for (const item of pending) {
+        if (this.destroyed) return;
+        await this.replayOutboxItem(item);
+      }
+    } finally {
+      this.flushingPeers.delete(remotePeerId);
+    }
+  }
+
+  private async replayOutboxItem(item: OutboxItem): Promise<void> {
+    if (item.kind === 'chat' && item.message) {
+      let blob: Blob | undefined;
+      if (item.message.attachment?.mediaId) {
+        const found = await getMediaBlob(item.message.attachment.mediaId);
+        if (!found) {
+          // If media blob no longer exists, send text notice or drop dead media
+          if (!item.message.text) {
+            removeOutboxByOpId(item.opId);
+            return;
+          }
+        } else {
+          blob = found;
+        }
+      }
+      await this.transmitChatMessage(
+        item.message,
+        blob,
+        item.targetPeerId,
+        item.opId,
+        false,
+      );
+      return;
+    }
+
+    if (item.kind === 'delete-msg' && item.messageId) {
+      await this.dispatchWirePacket(
+        {
+          kind: 'delete-msg',
+          opId: item.opId,
+          channelId: item.channelId,
+          messageId: item.messageId,
+          fromPeerId: this.localPeerId,
+        },
+        item.targetPeerId,
+        true,
+      );
+      return;
+    }
+
+    if (item.kind === 'clear-chat') {
+      await this.dispatchWirePacket(
+        {
+          kind: 'clear-chat',
+          opId: item.opId,
+          channelId: item.channelId,
+          clearedAt: item.createdAt,
+          fromPeerId: this.localPeerId,
+        },
+        item.targetPeerId,
+        true,
+      );
+      return;
+    }
+
+    if (item.kind === 'reaction' && item.messageId && item.emoji !== undefined) {
+      await this.dispatchWirePacket(
+        {
+          kind: 'reaction',
+          opId: item.opId,
+          channelId: item.channelId,
+          messageId: item.messageId,
+          emoji: item.emoji,
+          peerId: this.localPeerId,
+          add: Boolean(item.add),
+        },
+        item.targetPeerId,
+        true,
+      );
+    }
+  }
+
+  private sendSyncHello(): void {
+    if (this.destroyed) return;
+    const pkt: WirePacket = {
+      kind: 'sync-hello',
+      peerId: this.localPeerId,
+      name: this.localName,
+      timestamp: Date.now(),
+    };
+    void this.dispatchWirePacket(pkt, undefined, false);
+  }
+
+  private handleNetworkOnline = (): void => {
+    this.publishPresence();
+    this.sendSyncHello();
+  };
 
   private waitForDcDrain(dc: RTCDataChannel): Promise<void> {
     if (dc.bufferedAmount <= 256 * 1024 || dc.readyState !== 'open') {
@@ -445,6 +675,7 @@ export class P2PChatEngine {
       );
 
       this.publishPresence();
+      this.sendSyncHello();
     });
 
     client.on('offline', () => {
@@ -482,6 +713,7 @@ export class P2PChatEngine {
           if (!data.peerId || !data.name || typeof data.ts !== 'number') return;
           if (Date.now() - data.ts > PEER_TTL_MS) return;
 
+          const wasOffline = !this.peers.has(data.peerId);
           const existing = this.peers.get(data.peerId);
           this.upsertPeer(
             data.peerId,
@@ -492,6 +724,9 @@ export class P2PChatEngine {
             data.ts,
           );
           this.maybeInitiateWebRTC(data.peerId);
+          if (wasOffline) {
+            void this.flushOutboxForPeer(data.peerId, true);
+          }
         } catch {
           // Ignore invalid presence
         }
@@ -592,7 +827,7 @@ export class P2PChatEngine {
       }
     }
 
-    // 3. Encrypted Ephemeral Relay (used when direct WebRTC isn't already open for target)
+    // 3. Encrypted Ephemeral Relay (when direct WebRTC isn't already open for target)
     if (this.client?.connected && this.aesKey) {
       if (deliveredDirect && targetPeerId) return;
       if (!isImportant && deliveredDirect) return;
@@ -628,6 +863,7 @@ export class P2PChatEngine {
       const peerId = String(msg.peerId ?? '');
       const name = String(msg.name ?? 'User');
       if (!peerId || peerId === this.localPeerId) return;
+      const wasOffline = !this.peers.has(peerId);
       const existing = this.peers.get(peerId);
       this.upsertPeer(
         peerId,
@@ -638,6 +874,9 @@ export class P2PChatEngine {
         Date.now(),
       );
       this.maybeInitiateWebRTC(peerId);
+      if (wasOffline) {
+        void this.flushOutboxForPeer(peerId, true);
+      }
       return;
     }
 
@@ -677,11 +916,48 @@ export class P2PChatEngine {
     this.handleWirePacket(pkt, transport);
   }
 
+  private sendOpAck(opId: string | undefined, targetPeerId: string): void {
+    if (!opId) return;
+    const pkt: WirePacket = {
+      kind: 'op-ack',
+      opId,
+      fromPeerId: this.localPeerId,
+    };
+    void this.dispatchWirePacket(pkt, targetPeerId, false);
+  }
+
   private handleWirePacket(pkt: WirePacket, transport: TransportKind): void {
+    if (pkt.kind === 'sync-hello') {
+      if (pkt.peerId === this.localPeerId) return;
+      const existing = this.peers.get(pkt.peerId);
+      this.upsertPeer(
+        pkt.peerId,
+        pkt.name,
+        transport === 'broadcast' ? true : (existing?.sameDevice ?? false),
+        existing?.webrtcState ?? 'idle',
+        existing?.dataChannelOpen ?? false,
+        Date.now(),
+      );
+      this.maybeInitiateWebRTC(pkt.peerId);
+      void this.flushOutboxForPeer(pkt.peerId, true);
+      return;
+    }
+
+    if (pkt.kind === 'op-ack') {
+      if (pkt.fromPeerId === this.localPeerId) return;
+      removeOutboxByOpId(pkt.opId);
+      return;
+    }
+
     if (pkt.kind === 'media-meta') {
       const m = pkt.message;
       if (m.senderId === this.localPeerId) return;
-      if (this.seenMessageIds.has(m.id)) return;
+
+      const deletedIds = loadDeletedMessageIds();
+      if (deletedIds.has(m.id) || this.seenMessageIds.has(m.id)) {
+        this.sendOpAck(pkt.opId, m.senderId);
+        return;
+      }
       this.seenMessageIds.add(m.id);
 
       const existing = this.peers.get(m.senderId);
@@ -695,6 +971,7 @@ export class P2PChatEngine {
       );
 
       this.incomingTransfers.set(pkt.transferId, {
+        opId: pkt.opId,
         message: m,
         totalChunks: pkt.totalChunks,
         chunks: new Array<Uint8Array | undefined>(pkt.totalChunks),
@@ -729,6 +1006,7 @@ export class P2PChatEngine {
         true,
         Date.now(),
       );
+      void this.flushOutboxForPeer(pkt.peerId, true);
       return;
     }
 
@@ -747,6 +1025,13 @@ export class P2PChatEngine {
 
     if (pkt.kind === 'reaction') {
       if (pkt.peerId === this.localPeerId) return;
+      if (pkt.opId) {
+        if (this.seenOpIds.has(pkt.opId)) {
+          this.sendOpAck(pkt.opId, pkt.peerId);
+          return;
+        }
+        this.seenOpIds.add(pkt.opId);
+      }
       this.callbacks.onReactionReceived(
         pkt.channelId,
         pkt.messageId,
@@ -754,23 +1039,41 @@ export class P2PChatEngine {
         pkt.peerId,
         pkt.add,
       );
+      this.sendOpAck(pkt.opId, pkt.peerId);
       return;
     }
 
     if (pkt.kind === 'delete-msg') {
       if (pkt.fromPeerId === this.localPeerId) return;
+      if (pkt.opId) {
+        if (this.seenOpIds.has(pkt.opId)) {
+          this.sendOpAck(pkt.opId, pkt.fromPeerId);
+          return;
+        }
+        this.seenOpIds.add(pkt.opId);
+      }
       this.callbacks.onMessageDeleted(pkt.channelId, pkt.messageId);
+      this.sendOpAck(pkt.opId, pkt.fromPeerId);
       return;
     }
 
     if (pkt.kind === 'clear-chat') {
       if (pkt.fromPeerId === this.localPeerId) return;
-      this.callbacks.onChannelCleared(pkt.channelId);
+      if (pkt.opId) {
+        if (this.seenOpIds.has(pkt.opId)) {
+          this.sendOpAck(pkt.opId, pkt.fromPeerId);
+          return;
+        }
+        this.seenOpIds.add(pkt.opId);
+      }
+      this.callbacks.onChannelCleared(pkt.channelId, pkt.clearedAt);
+      this.sendOpAck(pkt.opId, pkt.fromPeerId);
       return;
     }
 
     if (pkt.kind === 'ack') {
       if (pkt.fromPeerId === this.localPeerId) return;
+      removeOutboxChatByMessageId(pkt.messageId, pkt.fromPeerId);
       this.callbacks.onMessageAcked(pkt.messageId);
       return;
     }
@@ -778,7 +1081,12 @@ export class P2PChatEngine {
     if (pkt.kind === 'chat') {
       const m = pkt.message;
       if (m.senderId === this.localPeerId) return;
-      if (this.seenMessageIds.has(m.id)) return;
+
+      const deletedIds = loadDeletedMessageIds();
+      if (deletedIds.has(m.id) || this.seenMessageIds.has(m.id)) {
+        this.sendOpAck(pkt.opId, m.senderId);
+        return;
+      }
       this.seenMessageIds.add(m.id);
 
       const existing = this.peers.get(m.senderId);
@@ -803,6 +1111,8 @@ export class P2PChatEngine {
         status: 'delivered',
         transport,
       });
+
+      this.sendOpAck(pkt.opId, m.senderId);
 
       const ack: WirePacket = {
         kind: 'ack',
@@ -846,6 +1156,7 @@ export class P2PChatEngine {
         await saveMediaBlob(mediaId, fullBlob);
       }
       this.callbacks.onMediaTransferProgress(tr.message.id, undefined);
+      this.sendOpAck(tr.opId, tr.message.senderId);
 
       const ack: WirePacket = {
         kind: 'ack',
@@ -946,6 +1257,7 @@ export class P2PChatEngine {
         timestamp: Date.now(),
       };
       dc.send(JSON.stringify(hello));
+      void this.flushOutboxForPeer(entry.peerId, true);
     };
 
     dc.onclose = () => {

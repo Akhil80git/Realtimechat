@@ -1,4 +1,10 @@
-import { ChatMessage, StorageStats, StoredContact, UserProfile } from '../types/chat';
+import {
+  ChatMessage,
+  OutboxItem,
+  StorageStats,
+  StoredContact,
+  UserProfile,
+} from '../types/chat';
 import {
   clearAllMediaBlobs,
   deleteMediaBlobs,
@@ -8,7 +14,11 @@ import {
 const PROFILE_KEY = 'varta_account_v2';
 const CONTACTS_KEY = 'varta_contacts_v2';
 const MSG_KEY = 'varta_messages_v2';
+const OUTBOX_KEY = 'varta_outbox_v1';
+const DELETED_IDS_KEY = 'varta_deleted_ids_v1';
 const MAX_MESSAGES = 2000;
+const MAX_OUTBOX = 600;
+const MAX_DELETED_IDS = 500;
 
 function safeParse<T>(raw: string | null, fallback: T): T {
   if (!raw) return fallback;
@@ -53,7 +63,22 @@ export function saveAllMessages(messages: ChatMessage[]): void {
   safeSet(MSG_KEY, trimmed);
 }
 
+export function loadDeletedMessageIds(): Set<string> {
+  return new Set(
+    safeParse<string[]>(localStorage.getItem(DELETED_IDS_KEY), []),
+  );
+}
+
+export function markMessageIdDeleted(messageId: string): void {
+  const list = safeParse<string[]>(localStorage.getItem(DELETED_IDS_KEY), []);
+  if (!list.includes(messageId)) {
+    list.push(messageId);
+    safeSet(DELETED_IDS_KEY, list.slice(-MAX_DELETED_IDS));
+  }
+}
+
 export async function deleteSingleMessage(messageId: string): Promise<ChatMessage[]> {
+  markMessageIdDeleted(messageId);
   const all = loadAllMessages();
   const target = all.find((m) => m.id === messageId);
   const remaining = all.filter((m) => m.id !== messageId);
@@ -64,16 +89,100 @@ export async function deleteSingleMessage(messageId: string): Promise<ChatMessag
   return remaining;
 }
 
-export async function clearChannelMessages(channelId: string): Promise<ChatMessage[]> {
+export async function clearChannelMessages(
+  channelId: string,
+  upToTimestamp?: number,
+): Promise<ChatMessage[]> {
   const all = loadAllMessages();
-  const removedMediaIds = all
-    .filter((m) => m.channelId === channelId && m.attachment?.mediaId)
-    .map((m) => m.attachment!.mediaId);
+  const shouldRemove = (m: ChatMessage) =>
+    m.channelId === channelId &&
+    (upToTimestamp === undefined || m.timestamp <= upToTimestamp);
 
-  const remaining = all.filter((m) => m.channelId !== channelId);
+  const removedMediaIds: string[] = [];
+  for (const m of all) {
+    if (shouldRemove(m)) {
+      markMessageIdDeleted(m.id);
+      if (m.attachment?.mediaId) {
+        removedMediaIds.push(m.attachment.mediaId);
+      }
+    }
+  }
+
+  const remaining = all.filter((m) => !shouldRemove(m));
   saveAllMessages(remaining);
   await deleteMediaBlobs(removedMediaIds);
   return remaining;
+}
+
+// --- Persistent Outbox for Offline-to-Online Sync ---
+
+export function loadOutbox(): OutboxItem[] {
+  return safeParse<OutboxItem[]>(localStorage.getItem(OUTBOX_KEY), []);
+}
+
+export function saveOutbox(items: OutboxItem[]): void {
+  safeSet(OUTBOX_KEY, items.slice(-MAX_OUTBOX));
+}
+
+export function enqueueOutboxItem(item: OutboxItem): void {
+  let list = loadOutbox();
+
+  if (item.kind === 'delete-msg' && item.messageId) {
+    // Cancel any unsent chat or reaction for the deleted message for this target
+    list = list.filter(
+      (o) =>
+        !(
+          o.targetPeerId === item.targetPeerId &&
+          (o.kind === 'chat' || o.kind === 'reaction') &&
+          (o.message?.id === item.messageId || o.messageId === item.messageId)
+        ),
+    );
+  } else if (item.kind === 'clear-chat') {
+    // Cancel all older pending ops for this channel+target before this clear
+    list = list.filter(
+      (o) =>
+        !(
+          o.targetPeerId === item.targetPeerId &&
+          o.channelId === item.channelId &&
+          o.createdAt <= item.createdAt
+        ),
+    );
+  }
+
+  list.push(item);
+  saveOutbox(list);
+}
+
+export function removeOutboxByOpId(opId: string): void {
+  const list = loadOutbox();
+  const next = list.filter((o) => o.opId !== opId);
+  if (next.length !== list.length) {
+    saveOutbox(next);
+  }
+}
+
+export function removeOutboxChatByMessageId(
+  messageId: string,
+  fromPeerId: string,
+): void {
+  const list = loadOutbox();
+  const next = list.filter(
+    (o) =>
+      !(
+        o.targetPeerId === fromPeerId &&
+        o.kind === 'chat' &&
+        o.message?.id === messageId
+      ),
+  );
+  if (next.length !== list.length) {
+    saveOutbox(next);
+  }
+}
+
+export function getOutboxForPeer(targetPeerId: string): OutboxItem[] {
+  return loadOutbox()
+    .filter((o) => o.targetPeerId === targetPeerId)
+    .sort((a, b) => a.createdAt - b.createdAt);
 }
 
 export function loadContacts(): StoredContact[] {

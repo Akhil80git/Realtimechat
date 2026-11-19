@@ -86,7 +86,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const loungeUnread = unreadByChannel.lounge ?? 0;
 
   const sidebarContent = (
-    <aside className="w-[290px] h-full flex flex-col bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 select-none">
+    <aside className="w-[290px] h-full min-h-0 flex flex-col bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 select-none">
       {/* Brand + Theme */}
       <div className="px-4 py-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
         <span className="font-display text-lg font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0">
@@ -167,7 +167,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* People & Public Lounge */}
-      <div className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-4 space-y-5">
         {/* Username Search */}
         <div className="px-1">
           <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 focus-within:border-blue-600">
@@ -348,7 +348,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Private Site Storage Footer (Delete-Only, No Export) */}
-      <div className="px-4 py-3 border-t border-slate-200 dark:border-slate-800 space-y-2.5 bg-slate-50/70 dark:bg-slate-900">
+      <div className="px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] border-t border-slate-200 dark:border-slate-800 space-y-2.5 bg-slate-50/70 dark:bg-slate-900 shrink-0">
         <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
           <span>In-Site Storage</span>
           <span className="font-mono tabular-nums">

@@ -72,13 +72,27 @@ export interface StorageStats {
   contactCount: number;
 }
 
+export interface OutboxItem {
+  opId: string;
+  targetPeerId: string;
+  kind: 'chat' | 'delete-msg' | 'clear-chat' | 'reaction';
+  channelId: string;
+  createdAt: number;
+  message?: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
+  messageId?: string;
+  emoji?: string;
+  add?: boolean;
+}
+
 export type WirePacket =
   | {
       kind: 'chat';
+      opId?: string;
       message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
     }
   | {
       kind: 'media-meta';
+      opId?: string;
       transferId: string;
       totalChunks: number;
       message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
@@ -92,6 +106,7 @@ export type WirePacket =
     }
   | {
       kind: 'reaction';
+      opId?: string;
       channelId: string;
       messageId: string;
       emoji: string;
@@ -100,13 +115,16 @@ export type WirePacket =
     }
   | {
       kind: 'delete-msg';
+      opId?: string;
       channelId: string;
       messageId: string;
       fromPeerId: string;
     }
   | {
       kind: 'clear-chat';
+      opId?: string;
       channelId: string;
+      clearedAt: number;
       fromPeerId: string;
     }
   | {
@@ -114,6 +132,17 @@ export type WirePacket =
       messageId: string;
       fromPeerId: string;
       channelId: string;
+    }
+  | {
+      kind: 'op-ack';
+      opId: string;
+      fromPeerId: string;
+    }
+  | {
+      kind: 'sync-hello';
+      peerId: string;
+      name: string;
+      timestamp: number;
     }
   | {
       kind: 'typing';

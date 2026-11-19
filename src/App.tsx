@@ -195,6 +195,29 @@ export default function App() {
     }
   }, [theme]);
 
+  useEffect(() => {
+    const updateViewportHeight = () => {
+      const vv = window.visualViewport;
+      const height = vv ? Math.round(vv.height) : window.innerHeight;
+      document.documentElement.style.setProperty('--app-height', `${height}px`);
+      if (vv && vv.offsetTop !== 0) {
+        window.scrollTo(0, 0);
+      }
+    };
+
+    updateViewportHeight();
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', updateViewportHeight);
+    vv?.addEventListener('scroll', updateViewportHeight);
+    window.addEventListener('resize', updateViewportHeight);
+
+    return () => {
+      vv?.removeEventListener('resize', updateViewportHeight);
+      vv?.removeEventListener('scroll', updateViewportHeight);
+      window.removeEventListener('resize', updateViewportHeight);
+    };
+  }, []);
+
   const refreshStats = useCallback(() => {
     void getStorageStatsAsync().then((stats) => {
       setStorageStats(stats);
@@ -287,8 +310,8 @@ export default function App() {
           refreshStats();
         });
       },
-      onChannelCleared: (channelId) => {
-        void clearChannelMessages(channelId).then((remaining) => {
+      onChannelCleared: (channelId, clearedAt) => {
+        void clearChannelMessages(channelId, clearedAt).then((remaining) => {
           setMessages(remaining);
           refreshStats();
         });
@@ -527,7 +550,7 @@ export default function App() {
   }, []);
 
   return (
-    <div className="h-screen w-screen overflow-hidden flex bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+    <div className="h-[var(--app-height,100dvh)] w-full overflow-hidden flex bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
       <Sidebar
         profile={profile}
         activeChannelId={activeChannelId}
