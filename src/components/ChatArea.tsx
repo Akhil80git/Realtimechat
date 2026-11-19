@@ -1,15 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Camera,
   Check,
   CheckCheck,
-  Copy,
-  Download,
   ExternalLink,
   FileText,
   Image as ImageIcon,
   Menu,
   Mic,
   Paperclip,
+  Plus,
+  QrCode,
   Reply,
   Search,
   SendHorizontal,
@@ -29,9 +30,9 @@ import {
   formatDuration,
   formatFileSize,
   getSupportedAudioMime,
-  prepareFileAttachment,
-  readBlobAsDataUrl,
+  prepareMediaAttachment,
 } from '../lib/media';
+import { getMediaObjectUrl } from '../lib/mediaVault';
 
 const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '🔥'];
 
@@ -43,16 +44,19 @@ interface ChatAreaProps {
   targetPeer: PeerInfo | null;
   onlinePeers: PeerInfo[];
   messages: ChatMessage[];
-  shareUrl: string;
   secondTabUrl: string;
   onOpenMobileSidebar: () => void;
+  onOpenQr: () => void;
+  onOpenCamera: () => void;
   onSelectChannel: (channelId: string) => void;
   onSendMessage: (
     text: string,
     attachment?: ChatAttachment,
+    mediaBlob?: Blob,
     replyTo?: ReplyRef,
   ) => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  onDeleteMessage: (messageId: string) => void;
   onTypingChange: (isTyping: boolean) => void;
   onClearChannel: () => void;
 }
@@ -87,6 +91,161 @@ function transportText(t: TransportKind): string {
   }
 }
 
+function useMediaSrc(attachment?: ChatAttachment, transferProgress?: number): string {
+  const [src, setSrc] = useState<string>(attachment?.dataUrl ?? '');
+
+  useEffect(() => {
+    if (!attachment) {
+      setSrc('');
+      return;
+    }
+    if (attachment.dataUrl) {
+      setSrc(attachment.dataUrl);
+      return;
+    }
+    if (transferProgress !== undefined) {
+      return;
+    }
+    let active = true;
+    void getMediaObjectUrl(attachment.mediaId).then((url) => {
+      if (active && url) {
+        setSrc(url);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [attachment, transferProgress]);
+
+  return src;
+}
+
+const PrivateAttachmentView: React.FC<{
+  attachment: ChatAttachment;
+  transferProgress?: number;
+  isOwn: boolean;
+  onOpenImage: (src: string, name: string) => void;
+}> = ({ attachment, transferProgress, isOwn, onOpenImage }) => {
+  const src = useMediaSrc(attachment, transferProgress);
+
+  if (transferProgress !== undefined && !src) {
+    return (
+      <div className="min-w-[200px] space-y-1.5 py-1">
+        <div className="flex items-center justify-between text-xs">
+          <span className="truncate max-w-[160px]">{attachment.name}</span>
+          <span className="font-mono tabular-nums">{transferProgress}%</span>
+        </div>
+        <div className="w-full h-1.5 rounded-full bg-black/15 dark:bg-white/15 overflow-hidden">
+          <div
+            className="h-full bg-current transition-all duration-150"
+            style={{ width: `${transferProgress}%` }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (attachment.kind === 'image') {
+    if (!src) {
+      return (
+        <div className="px-3 py-2 text-xs opacity-75">
+          Media removed from site storage
+        </div>
+      );
+    }
+    return (
+      <button
+        type="button"
+        onClick={() => onOpenImage(src, attachment.name)}
+        className="block rounded-lg overflow-hidden focus:outline-none focus:ring-2 focus:ring-white/60"
+      >
+        <img
+          src={src}
+          alt={attachment.name}
+          draggable={false}
+          onContextMenu={(e) => e.preventDefault()}
+          referrerPolicy="no-referrer"
+          className="max-h-72 w-auto max-w-full object-contain rounded-lg cursor-zoom-in select-none"
+        />
+      </button>
+    );
+  }
+
+  if (attachment.kind === 'video') {
+    if (!src) {
+      return (
+        <div className="px-3 py-2 text-xs opacity-75">
+          Video removed from site storage
+        </div>
+      );
+    }
+    return (
+      <div className="max-w-[320px] space-y-1">
+        <video
+          src={src}
+          controls
+          playsInline
+          controlsList="nodownload noplaybackrate"
+          disablePictureInPicture
+          onContextMenu={(e) => e.preventDefault()}
+          className="w-full max-h-72 rounded-lg bg-black"
+        />
+        <div className="text-[11px] font-mono tabular-nums opacity-75">
+          {formatFileSize(attachment.size)} · In-site playback only
+        </div>
+      </div>
+    );
+  }
+
+  if (attachment.kind === 'voice') {
+    if (!src) {
+      return (
+        <div className="px-3 py-2 text-xs opacity-75">
+          Voice note removed
+        </div>
+      );
+    }
+    return (
+      <div className="min-w-[220px] space-y-1">
+        <audio
+          controls
+          src={src}
+          controlsList="nodownload"
+          onContextMenu={(e) => e.preventDefault()}
+          className="w-full h-9"
+        />
+        {attachment.durationMs !== undefined && (
+          <div
+            className={`text-[11px] font-mono tabular-nums ${
+              isOwn ? 'text-blue-100' : 'text-slate-500 dark:text-slate-400'
+            }`}
+          >
+            Voice note · {formatDuration(attachment.durationMs)}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`flex items-center gap-3 px-3 py-2 rounded-lg ${
+        isOwn
+          ? 'bg-blue-700/70 text-white'
+          : 'bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100'
+      }`}
+    >
+      <FileText className="w-5 h-5 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-medium truncate">{attachment.name}</div>
+        <div className="text-[11px] font-mono tabular-nums opacity-75">
+          {formatFileSize(attachment.size)} · In-site only
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export const ChatArea: React.FC<ChatAreaProps> = ({
   localPeerId,
   localName,
@@ -95,20 +254,24 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   targetPeer,
   onlinePeers,
   messages,
-  shareUrl,
   secondTabUrl,
   onOpenMobileSidebar,
+  onOpenQr,
+  onOpenCamera,
   onSelectChannel,
   onSendMessage,
   onToggleReaction,
+  onDeleteMessage,
   onTypingChange,
   onClearChannel,
 }) => {
   const [draft, setDraft] = useState('');
-  const [copiedLink, setCopiedLink] = useState(false);
-  const [pendingAttachment, setPendingAttachment] = useState<ChatAttachment | null>(
-    null,
-  );
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [pendingMedia, setPendingMedia] = useState<{
+    attachment: ChatAttachment;
+    blob: Blob;
+    previewUrl: string;
+  } | null>(null);
   const [replyingTo, setReplyingTo] = useState<ReplyRef | null>(null);
   const [mediaError, setMediaError] = useState('');
   const [isDragging, setIsDragging] = useState(false);
@@ -117,11 +280,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     name: string;
   } | null>(null);
 
-  // Search state
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Voice recording state
   const [isRecording, setIsRecording] = useState(false);
   const [recordMs, setRecordMs] = useState(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -131,8 +292,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const mediaInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const attachMenuRef = useRef<HTMLDivElement | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
 
   const channelMessages = useMemo(() => {
@@ -153,7 +315,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     }
   }, [channelMessages.length, activeChannelId, searchQuery]);
 
-  // Close lightbox on Escape
   useEffect(() => {
     if (!lightboxImage) return;
     const onKey = (e: KeyboardEvent) => {
@@ -163,7 +324,27 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return () => window.removeEventListener('keydown', onKey);
   }, [lightboxImage]);
 
-  // Clean up voice recording on unmount
+  useEffect(() => {
+    if (!attachMenuOpen) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (
+        attachMenuRef.current &&
+        !attachMenuRef.current.contains(e.target as Node)
+      ) {
+        setAttachMenuOpen(false);
+      }
+    };
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setAttachMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handleOutside);
+    window.addEventListener('keydown', handleEsc);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      window.removeEventListener('keydown', handleEsc);
+    };
+  }, [attachMenuOpen]);
+
   useEffect(() => {
     return () => {
       if (recordTimerRef.current !== null) clearInterval(recordTimerRef.current);
@@ -188,12 +369,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   const connectionSummary = useMemo(() => {
     if (targetPeer) {
-      if (targetPeer.dataChannelOpen) return 'WebRTC Direct · Saved locally';
-      if (targetPeer.sameDevice) return 'Same-Device Channel · Saved locally';
-      return 'Direct Live · Saved locally';
+      if (targetPeer.dataChannelOpen) return 'WebRTC Direct · In-site only';
+      if (targetPeer.sameDevice) return 'Same-Device Channel · In-site only';
+      return 'Direct Live · In-site only';
     }
     if (activeChannelId !== 'lounge') {
-      return 'Offline right now · Saved locally';
+      return 'Offline right now · In-site only';
     }
     const directCount = onlinePeers.filter((p) => p.dataChannelOpen).length;
     if (directCount > 0) {
@@ -202,25 +383,28 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     if (onlinePeers.length > 0) {
       return `${onlinePeers.length + 1} online · Real-time sync`;
     }
-    return 'Waiting for friends to open the site · Saved locally';
+    return 'Scan QR or open on another device · In-site only';
   }, [activeChannelId, onlinePeers, targetPeer]);
 
-  const handleCopyShare = async () => {
-    try {
-      await navigator.clipboard.writeText(shareUrl);
-      setCopiedLink(true);
-      setTimeout(() => setCopiedLink(false), 2000);
-    } catch {
-      // Ignore clipboard failure
+  const clearPending = () => {
+    if (pendingMedia?.previewUrl) {
+      URL.revokeObjectURL(pendingMedia.previewUrl);
     }
+    setPendingMedia(null);
   };
 
   const handleSelectedFile = async (file: File | undefined) => {
     if (!file) return;
     setMediaError('');
     try {
-      const prepared = await prepareFileAttachment(file);
-      setPendingAttachment(prepared);
+      const prepared = await prepareMediaAttachment(file);
+      clearPending();
+      const previewUrl = URL.createObjectURL(file);
+      setPendingMedia({
+        attachment: prepared.attachment,
+        blob: prepared.blob,
+        previewUrl,
+      });
       textareaRef.current?.focus();
     } catch (err) {
       setMediaError(
@@ -280,12 +464,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       };
 
       recordTimerRef.current = window.setInterval(() => {
-        const elapsed = Date.now() - recordStartRef.current;
-        setRecordMs(elapsed);
-        // Auto-stop at 60s to keep serverless P2P payloads lightweight
-        if (elapsed >= 60000) {
-          void finishVoiceRecording(true);
-        }
+        setRecordMs(Date.now() - recordStartRef.current);
       }, 250);
 
       recorder.start(250);
@@ -329,36 +508,33 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     });
     recordChunksRef.current = [];
 
-    if (blob.size > 1.5 * 1024 * 1024) {
-      setMediaError('Voice note exceeded 1.5 MB limit.');
-      return;
-    }
-
-    const dataUrl = await readBlobAsDataUrl(blob);
-    const voiceAttachment: ChatAttachment = {
-      kind: 'voice',
-      name: `voice-${Date.now()}.webm`,
-      mimeType: blob.type,
-      size: blob.size,
-      dataUrl,
+    const prepared = await prepareMediaAttachment(
+      blob,
+      `voice-${Date.now()}.webm`,
       durationMs,
-    };
+    );
 
-    onSendMessage('', voiceAttachment, replyingTo ?? undefined);
+    onSendMessage(
+      '',
+      prepared.attachment,
+      prepared.blob,
+      replyingTo ?? undefined,
+    );
     setReplyingTo(null);
   };
 
   const submitMessage = () => {
     const text = draft.trim();
-    if (!text && !pendingAttachment) return;
+    if (!text && !pendingMedia) return;
 
     onSendMessage(
       text,
-      pendingAttachment ?? undefined,
+      pendingMedia?.attachment,
+      pendingMedia?.blob,
       replyingTo ?? undefined,
     );
     setDraft('');
-    setPendingAttachment(null);
+    clearPending();
     setReplyingTo(null);
     setMediaError('');
     onTypingChange(false);
@@ -414,15 +590,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       }}
       onDrop={handleDrop}
     >
-      {/* Drag-and-drop overlay */}
       {isDragging && (
         <div className="absolute inset-0 z-30 bg-blue-600/10 backdrop-blur-[2px] border-2 border-dashed border-blue-600 m-3 rounded-xl flex items-center justify-center pointer-events-none">
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl px-6 py-4 text-center">
             <p className="font-display text-base font-semibold text-slate-900 dark:text-white">
-              Drop image or file to send
+              Drop any photo, video, or file to send
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              Images are automatically optimized for instant P2P delivery
+              Stays private inside the site with zero MB limits
             </p>
           </div>
         </div>
@@ -471,7 +646,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <button
               type="button"
               onClick={onClearChannel}
-              aria-label="Clear messages in this chat"
+              aria-label="Delete messages in this chat"
               className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors shrink-0"
             >
               <Trash2 className="w-4 h-4" />
@@ -480,11 +655,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
           <button
             type="button"
-            onClick={() => void handleCopyShare()}
+            onClick={onOpenQr}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium transition-colors whitespace-nowrap shrink-0"
           >
-            {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-            <span>{copiedLink ? 'Link Copied' : 'Share Site Link'}</span>
+            <QrCode className="w-3.5 h-3.5" />
+            <span>QR Connect</span>
           </button>
         </div>
       </header>
@@ -498,7 +673,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             autoFocus
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search messages or filenames in this conversation..."
+            placeholder="Search messages or media names..."
             className="flex-1 bg-transparent text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none"
           />
           {searchQuery && (
@@ -523,17 +698,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   {searchQuery.trim()
                     ? 'No matching messages'
                     : targetPeer
-                      ? `Start chatting with ${targetPeer.name}`
+                      ? `Chat directly with ${targetPeer.name}`
                       : `Signed in as ${localName}`}
                 </h2>
                 <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
                   {searchQuery.trim()
                     ? `No messages matched "${searchQuery}".`
                     : targetPeer
-                      ? `Send text, photos, voice notes, or files directly to ${targetPeer.name}.`
+                      ? `Send text, photos, videos, or voice notes directly to ${targetPeer.name}. Nothing is saved to device gallery or exported.`
                       : onlinePeers.length > 0
                         ? 'Pick someone online below for a 1-to-1 chat, or send a message here in Everyone Online.'
-                        : 'Share this site link with friends on any phone or browser. As soon as they enter their name, they will appear here.'}
+                        : 'Show your QR code so friends can scan with Google Lens or phone camera and chat directly with you.'}
                 </p>
               </div>
 
@@ -558,11 +733,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5 pt-1">
                   <button
                     type="button"
-                    onClick={() => void handleCopyShare()}
+                    onClick={onOpenQr}
                     className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium transition-colors whitespace-nowrap"
                   >
-                    {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                    <span>{copiedLink ? 'Copied' : 'Copy Site Link'}</span>
+                    <QrCode className="w-3.5 h-3.5" />
+                    <span>Show My QR Code</span>
                   </button>
 
                   <a
@@ -609,7 +784,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
                   <div
                     id={`msg-${msg.id}`}
-                    className={`group flex flex-col ${
+                    tabIndex={0}
+                    className={`group flex flex-col focus:outline-none ${
                       isOwn ? 'items-end' : 'items-start'
                     } ${isGrouped ? '-mt-2.5' : ''}`}
                   >
@@ -637,7 +813,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                             : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-slate-100'
                         }`}
                       >
-                        {/* Quoted Reply */}
                         {msg.replyTo && (
                           <button
                             type="button"
@@ -657,81 +832,23 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           </button>
                         )}
 
-                        {/* Image Attachment */}
-                        {msg.attachment?.kind === 'image' && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setLightboxImage({
-                                src: msg.attachment!.dataUrl,
-                                name: msg.attachment!.name,
-                              })
+                        {msg.attachment && (
+                          <PrivateAttachmentView
+                            attachment={msg.attachment}
+                            transferProgress={msg.transferProgress}
+                            isOwn={isOwn}
+                            onOpenImage={(src, name) =>
+                              setLightboxImage({ src, name })
                             }
-                            className="block rounded-lg overflow-hidden focus:outline-none focus:ring-2 focus:ring-white/60"
-                          >
-                            <img
-                              src={msg.attachment.dataUrl}
-                              alt={msg.attachment.name}
-                              referrerPolicy="no-referrer"
-                              className="max-h-72 w-auto max-w-full object-contain rounded-lg cursor-zoom-in"
-                            />
-                          </button>
+                          />
                         )}
 
-                        {/* Voice Attachment */}
-                        {msg.attachment?.kind === 'voice' && (
-                          <div className="min-w-[220px] space-y-1">
-                            <audio
-                              controls
-                              src={msg.attachment.dataUrl}
-                              className="w-full h-9"
-                            />
-                            {msg.attachment.durationMs !== undefined && (
-                              <div
-                                className={`text-[11px] font-mono tabular-nums ${
-                                  isOwn
-                                    ? 'text-blue-100'
-                                    : 'text-slate-500 dark:text-slate-400'
-                                }`}
-                              >
-                                Voice note · {formatDuration(msg.attachment.durationMs)}
-                              </div>
-                            )}
-                          </div>
-                        )}
-
-                        {/* Generic File Attachment */}
-                        {msg.attachment?.kind === 'file' && (
-                          <a
-                            href={msg.attachment.dataUrl}
-                            download={msg.attachment.name}
-                            className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
-                              isOwn
-                                ? 'bg-blue-700/70 hover:bg-blue-700 text-white'
-                                : 'bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100'
-                            }`}
-                          >
-                            <FileText className="w-5 h-5 shrink-0" />
-                            <div className="min-w-0 flex-1">
-                              <div className="text-xs font-medium truncate">
-                                {msg.attachment.name}
-                              </div>
-                              <div className="text-[11px] font-mono tabular-nums opacity-75">
-                                {formatFileSize(msg.attachment.size)}
-                              </div>
-                            </div>
-                            <Download className="w-4 h-4 shrink-0" />
-                          </a>
-                        )}
-
-                        {/* Text */}
                         {msg.text && (
                           <div className="whitespace-pre-wrap">{msg.text}</div>
                         )}
                       </div>
 
-                      {/* Quick Action Strip (Reply + Emojis) */}
-                      <div className="opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity flex items-center gap-0.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-1 py-0.5 shrink-0">
+                      <div className="opacity-0 group-hover:opacity-100 group-focus:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-opacity flex items-center gap-0.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-1 py-0.5 shrink-0">
                         <button
                           type="button"
                           onClick={() =>
@@ -760,10 +877,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                             {emoji}
                           </button>
                         ))}
+                        <button
+                          type="button"
+                          onClick={() => onDeleteMessage(msg.id)}
+                          aria-label="Delete message for everyone"
+                          className="p-1 rounded text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
                     </div>
 
-                    {/* Reaction Counts */}
                     {reactionEntries.length > 0 && (
                       <div className="mt-1 px-1 flex flex-wrap items-center gap-1.5">
                         {reactionEntries.map(([emoji, peerList]) => {
@@ -789,13 +913,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       </div>
                     )}
 
-                    {/* Delivery & Transport Metadata */}
                     <div className="mt-1 px-1 flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-slate-500 font-mono tabular-nums">
                       {isGrouped && <span>{formatTime(msg.timestamp)}</span>}
                       {!isOwn && <span>{transportText(msg.transport)}</span>}
                       {isOwn && (
                         <span className="inline-flex items-center gap-1">
-                          {msg.status === 'delivered' ? (
+                          {msg.transferProgress !== undefined ? (
+                            <span>Sending {msg.transferProgress}%</span>
+                          ) : msg.status === 'delivered' ? (
                             <>
                               <CheckCheck className="w-3 h-3 text-blue-600 dark:text-blue-400" />
                               <span>Delivered</span>
@@ -821,7 +946,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       {/* Composer & Previews */}
       <footer className="px-4 sm:px-6 pb-4 pt-2 bg-slate-50 dark:bg-slate-950 shrink-0">
         <div className="max-w-3xl mx-auto space-y-2">
-          {/* Typing or Media Error Bar */}
           <div className="min-h-[20px] px-1 flex items-center justify-between text-xs">
             <span className="text-slate-500 dark:text-slate-400">
               {typingPeers.length > 0 && (
@@ -838,7 +962,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             )}
           </div>
 
-          {/* Reply Preview */}
           {replyingTo && (
             <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs">
               <div className="min-w-0">
@@ -860,14 +983,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
           )}
 
-          {/* Pending Image/File Attachment Preview */}
-          {pendingAttachment && (
+          {pendingMedia && (
             <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
               <div className="flex items-center gap-3 min-w-0">
-                {pendingAttachment.kind === 'image' ? (
+                {pendingMedia.attachment.kind === 'image' ? (
                   <img
-                    src={pendingAttachment.dataUrl}
-                    alt={pendingAttachment.name}
+                    src={pendingMedia.previewUrl}
+                    alt={pendingMedia.attachment.name}
                     className="w-12 h-12 rounded-md object-cover shrink-0 border border-slate-200 dark:border-slate-700"
                   />
                 ) : (
@@ -877,16 +999,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 )}
                 <div className="min-w-0">
                   <div className="text-xs font-medium text-slate-900 dark:text-white truncate">
-                    {pendingAttachment.name}
+                    {pendingMedia.attachment.name}
                   </div>
                   <div className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                    {formatFileSize(pendingAttachment.size)} · Ready to send
+                    {formatFileSize(pendingMedia.attachment.size)} · Stays in site only
                   </div>
                 </div>
               </div>
               <button
                 type="button"
-                onClick={() => setPendingAttachment(null)}
+                onClick={clearPending}
                 aria-label="Remove attachment"
                 className="p-1.5 rounded-md text-slate-400 hover:text-slate-700 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
               >
@@ -895,11 +1017,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
           )}
 
-          {/* Hidden File Inputs */}
+          {/* Hidden File Inputs (No size limits) */}
           <input
-            ref={imageInputRef}
+            ref={mediaInputRef}
             type="file"
-            accept="image/*"
+            accept="image/*,video/*"
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0];
@@ -918,7 +1040,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             }}
           />
 
-          {/* Main Input Row or Active Voice Recorder */}
           {isRecording ? (
             <div className="flex items-center justify-between gap-3 bg-white dark:bg-slate-900 border border-red-500/60 rounded-xl px-4 py-2.5">
               <div className="flex items-center gap-2.5 text-sm font-medium text-red-600 dark:text-red-400">
@@ -948,24 +1069,85 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               </div>
             </div>
           ) : (
-            <div className="flex items-end gap-1.5 sm:gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-2 focus-within:border-blue-600 focus-within:ring-2 focus-within:ring-blue-600/15 transition-shadow">
-              <button
-                type="button"
-                onClick={() => imageInputRef.current?.click()}
-                aria-label="Send photo"
-                className="p-2 rounded-lg text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors shrink-0"
-              >
-                <ImageIcon className="w-5 h-5" />
-              </button>
+            <div className="relative flex items-end gap-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-2 focus-within:border-blue-600 focus-within:ring-2 focus-within:ring-blue-600/15 transition-shadow">
+              <div ref={attachMenuRef} className="relative shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setAttachMenuOpen((v) => !v)}
+                  aria-label="Open media and file options"
+                  aria-expanded={attachMenuOpen}
+                  className={`p-2 rounded-lg transition-colors ${
+                    attachMenuOpen
+                      ? 'bg-blue-600 text-white'
+                      : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  <Plus
+                    className={`w-5 h-5 transition-transform duration-150 ${
+                      attachMenuOpen ? 'rotate-45' : ''
+                    }`}
+                  />
+                </button>
 
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                aria-label="Attach file"
-                className="p-2 rounded-lg text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors shrink-0"
-              >
-                <Paperclip className="w-5 h-5" />
-              </button>
+                {attachMenuOpen && (
+                  <div
+                    role="menu"
+                    className="absolute bottom-12 left-0 z-30 w-52 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-1.5 shadow-lg space-y-0.5"
+                  >
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        onOpenCamera();
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                    >
+                      <Camera className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                      <span>Camera (Photo / Video)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        mediaInputRef.current?.click();
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                    >
+                      <ImageIcon className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>Photo & Video</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        fileInputRef.current?.click();
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                    >
+                      <Paperclip className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+                      <span>Any File</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachMenuOpen(false);
+                        void startVoiceRecording();
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                    >
+                      <Mic className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0" />
+                      <span>Voice Note</span>
+                    </button>
+                  </div>
+                )}
+              </div>
 
               <textarea
                 ref={textareaRef}
@@ -974,11 +1156,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 onChange={handleDraftChange}
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
-                placeholder={`Message ${channelTitle}... (or paste/drop an image)`}
-                className="flex-1 resize-none bg-transparent px-2 py-2 text-[15px] text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none max-h-[140px]"
+                placeholder={`Message ${channelTitle}...`}
+                className="flex-1 min-w-0 resize-none bg-transparent px-2 py-2 text-[15px] text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none max-h-[140px]"
               />
 
-              {!draft.trim() && !pendingAttachment ? (
+              {!draft.trim() && !pendingMedia ? (
                 <button
                   type="button"
                   onClick={() => void startVoiceRecording()}
@@ -1003,10 +1185,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
       </footer>
 
-      {/* Image Lightbox Modal */}
+      {/* View-Only Image Lightbox (No Download Button) */}
       {lightboxImage && (
         <div
-          className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-xs flex flex-col items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-xs flex flex-col items-center justify-center p-4"
           role="dialog"
           aria-modal="true"
           onClick={() => setLightboxImage(null)}
@@ -1018,30 +1200,22 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <span className="text-sm font-medium truncate">
               {lightboxImage.name}
             </span>
-            <div className="flex items-center gap-2 shrink-0">
-              <a
-                href={lightboxImage.src}
-                download={lightboxImage.name}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-xs font-medium"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Download</span>
-              </a>
-              <button
-                type="button"
-                onClick={() => setLightboxImage(null)}
-                aria-label="Close preview"
-                className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={() => setLightboxImage(null)}
+              aria-label="Close preview"
+              className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
           </div>
           <img
             src={lightboxImage.src}
             alt={lightboxImage.name}
+            draggable={false}
+            onContextMenu={(e) => e.preventDefault()}
             onClick={(e) => e.stopPropagation()}
-            className="max-h-[82vh] max-w-full rounded-lg object-contain"
+            className="max-h-[82vh] max-w-full rounded-lg object-contain select-none"
           />
         </div>
       )}

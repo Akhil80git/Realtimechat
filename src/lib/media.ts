@@ -1,11 +1,11 @@
 import { ChatAttachment } from '../types/chat';
-
-export const MAX_RAW_FILE_BYTES = 1.5 * 1024 * 1024; // 1.5 MB for reliable P2P + localStorage
+import { saveMediaBlob } from './mediaVault';
 
 export function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 export function formatDuration(ms: number): string {
@@ -31,86 +31,81 @@ export function getSupportedAudioMime(): string {
   return '';
 }
 
-export async function compressImageFile(file: File): Promise<ChatAttachment> {
-  const objectUrl = URL.createObjectURL(file);
-  try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const el = new Image();
-      el.onload = () => resolve(el);
-      el.onerror = () => reject(new Error('Could not decode image'));
-      el.src = objectUrl;
-    });
-
-    const maxDim = 1080;
-    let { width, height } = img;
-    if (width > maxDim || height > maxDim) {
-      const ratio = Math.min(maxDim / width, maxDim / height);
-      width = Math.max(1, Math.round(width * ratio));
-      height = Math.max(1, Math.round(height * ratio));
+export function getSupportedVideoMime(): string {
+  if (typeof MediaRecorder === 'undefined') return 'video/webm';
+  const candidates = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+    'video/mp4',
+  ];
+  for (const mime of candidates) {
+    if (MediaRecorder.isTypeSupported(mime)) {
+      return mime;
     }
+  }
+  return '';
+}
 
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      throw new Error('Canvas not supported');
+export function generateMediaId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `m_${crypto.randomUUID().replace(/-/g, '').slice(0, 14)}`;
+  }
+  return `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export async function prepareMediaAttachment(
+  fileOrBlob: File | Blob,
+  overrideName?: string,
+  durationMs?: number,
+): Promise<{ attachment: ChatAttachment; blob: Blob }> {
+  const mime = fileOrBlob.type || 'application/octet-stream';
+  const name =
+    overrideName ??
+    (fileOrBlob instanceof File ? fileOrBlob.name : `media-${Date.now()}`);
+  const mediaId = generateMediaId();
+
+  // Read image dimensions cleanly without storing in phone gallery
+  let width: number | undefined;
+  let height: number | undefined;
+
+  let kind: ChatAttachment['kind'] = 'file';
+  if (mime.startsWith('image/')) {
+    kind = 'image';
+    const objUrl = URL.createObjectURL(fileOrBlob);
+    try {
+      const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+        img.onerror = () => resolve({ w: 0, h: 0 });
+        img.src = objUrl;
+      });
+      if (dims.w > 0) {
+        width = dims.w;
+        height = dims.h;
+      }
+    } finally {
+      URL.revokeObjectURL(objUrl);
     }
-    ctx.drawImage(img, 0, 0, width, height);
+  } else if (mime.startsWith('video/')) {
+    kind = 'video';
+  } else if (mime.startsWith('audio/')) {
+    kind = durationMs !== undefined ? 'voice' : 'file';
+  }
 
-    // Prefer WebP for high quality at tiny P2P byte sizes; fallback to JPEG
-    let dataUrl = canvas.toDataURL('image/webp', 0.78);
-    let mimeType = 'image/webp';
-    if (!dataUrl.startsWith('data:image/webp')) {
-      dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-      mimeType = 'image/jpeg';
-    }
+  await saveMediaBlob(mediaId, fileOrBlob);
 
-    const approxBytes = Math.round((dataUrl.length * 3) / 4);
-    return {
-      kind: 'image',
-      name: file.name || `photo-${Date.now()}.webp`,
-      mimeType,
-      size: approxBytes,
-      dataUrl,
+  return {
+    attachment: {
+      kind,
+      name,
+      mimeType: mime,
+      size: fileOrBlob.size,
+      mediaId,
+      durationMs,
       width,
       height,
-    };
-  } finally {
-    URL.revokeObjectURL(objectUrl);
-  }
-}
-
-export function readBlobAsDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        resolve(reader.result);
-      } else {
-        reject(new Error('Failed to read file'));
-      }
-    };
-    reader.onerror = () => reject(new Error('Failed to read file'));
-    reader.readAsDataURL(blob);
-  });
-}
-
-export async function prepareFileAttachment(file: File): Promise<ChatAttachment> {
-  if (file.type.startsWith('image/')) {
-    return compressImageFile(file);
-  }
-
-  if (file.size > MAX_RAW_FILE_BYTES) {
-    throw new Error('File must be under 1.5 MB for direct browser-to-browser transfer.');
-  }
-
-  const dataUrl = await readBlobAsDataUrl(file);
-  return {
-    kind: 'file',
-    name: file.name,
-    mimeType: file.type || 'application/octet-stream',
-    size: file.size,
-    dataUrl,
+    },
+    blob: fileOrBlob,
   };
 }

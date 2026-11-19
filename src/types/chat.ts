@@ -10,11 +10,14 @@ export interface UserProfile {
 }
 
 export interface ChatAttachment {
-  kind: 'image' | 'voice' | 'file';
+  kind: 'image' | 'video' | 'voice' | 'file';
   name: string;
   mimeType: string;
   size: number;
-  dataUrl: string;
+  /** IndexedDB blob key for in-site private storage */
+  mediaId: string;
+  /** Optional inline preview/fallback dataUrl for tiny legacy items */
+  dataUrl?: string;
   durationMs?: number;
   width?: number;
   height?: number;
@@ -36,11 +39,12 @@ export interface ChatMessage {
   text: string;
   attachment?: ChatAttachment;
   replyTo?: ReplyRef;
-  /** Map of emoji -> array of peerIds who reacted */
   reactions?: Record<string, string[]>;
   timestamp: number;
   status: DeliveryStatus;
   transport: TransportKind;
+  /** 0-100 transfer progress while sending/receiving large media */
+  transferProgress?: number;
 }
 
 export interface PeerInfo {
@@ -71,13 +75,19 @@ export interface StorageStats {
 export type WirePacket =
   | {
       kind: 'chat';
-      message: Omit<ChatMessage, 'status' | 'transport'>;
+      message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
     }
   | {
-      kind: 'chunk';
+      kind: 'media-meta';
+      transferId: string;
+      totalChunks: number;
+      message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
+    }
+  | {
+      kind: 'media-chunk';
       transferId: string;
       index: number;
-      total: number;
+      totalChunks: number;
       data: string;
     }
   | {
@@ -87,6 +97,17 @@ export type WirePacket =
       emoji: string;
       peerId: string;
       add: boolean;
+    }
+  | {
+      kind: 'delete-msg';
+      channelId: string;
+      messageId: string;
+      fromPeerId: string;
+    }
+  | {
+      kind: 'clear-chat';
+      channelId: string;
+      fromPeerId: string;
     }
   | {
       kind: 'ack';

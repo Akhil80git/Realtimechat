@@ -4,6 +4,7 @@ import {
   deriveAesKey,
   encryptPacket,
 } from './crypto';
+import { saveMediaBlob } from './mediaVault';
 import {
   ChatMessage,
   PeerInfo,
@@ -28,12 +29,13 @@ const ICE_SERVERS: RTCIceServer[] = [
 const HEARTBEAT_MS = 12000;
 const PEER_TTL_MS = 45000;
 const TYPING_TTL_MS = 2600;
-const CHUNK_SIZE_CHARS = 28000;
-const CHUNK_ASSEMBLY_TTL_MS = 45000;
+const MEDIA_CHUNK_BYTES = 28 * 1024;
+const TRANSFER_TTL_MS = 1000 * 60 * 10;
 
 export interface EngineCallbacks {
   onPeersChange: (peers: PeerInfo[]) => void;
   onMessageReceived: (message: ChatMessage) => void;
+  onMediaTransferProgress: (messageId: string, progress: number | undefined) => void;
   onMessageAcked: (messageId: string) => void;
   onReactionReceived: (
     channelId: string,
@@ -42,6 +44,8 @@ export interface EngineCallbacks {
     peerId: string,
     add: boolean,
   ) => void;
+  onMessageDeleted: (channelId: string, messageId: string) => void;
+  onChannelCleared: (channelId: string) => void;
   onConnectionStatusChange: (connected: boolean, brokerLabel: string) => void;
 }
 
@@ -55,12 +59,32 @@ interface PeerConnectionEntry {
   remoteDescSet: boolean;
 }
 
-interface ChunkBuffer {
-  total: number;
-  parts: (string | undefined)[];
-  received: number;
+interface IncomingMediaTransfer {
+  message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>;
+  totalChunks: number;
+  chunks: (Uint8Array | undefined)[];
+  receivedCount: number;
+  lastProgressPct: number;
   createdAt: number;
   transport: TransportKind;
+}
+
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + step));
+  }
+  return btoa(binary);
+}
+
+function base64ToUint8(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 export class P2PChatEngine {
@@ -76,7 +100,7 @@ export class P2PChatEngine {
   private rtcEntries = new Map<string, PeerConnectionEntry>();
   private seenMessageIds = new Set<string>();
   private seenSignalIds = new Set<string>();
-  private chunkBuffers = new Map<string, ChunkBuffer>();
+  private incomingTransfers = new Map<string, IncomingMediaTransfer>();
 
   private heartbeatTimer: number | null = null;
   private cleanupTimer: number | null = null;
@@ -104,7 +128,7 @@ export class P2PChatEngine {
     this.destroyed = false;
     this.seenMessageIds.clear();
     this.seenSignalIds.clear();
-    this.chunkBuffers.clear();
+    this.incomingTransfers.clear();
     for (const m of existingMessages) {
       this.seenMessageIds.add(m.id);
     }
@@ -176,42 +200,87 @@ export class P2PChatEngine {
       this.closeRtcEntry(entry);
     }
     this.rtcEntries.clear();
-    this.chunkBuffers.clear();
+    this.incomingTransfers.clear();
     this.peers.clear();
     this.callbacks.onPeersChange([]);
     this.callbacks.onConnectionStatusChange(false, 'Disconnected');
   }
 
   public async sendMessage(
-    message: Omit<ChatMessage, 'status' | 'transport'>,
+    message: Omit<ChatMessage, 'status' | 'transport' | 'transferProgress'>,
+    mediaBlob?: Blob,
     targetPeerId?: string,
   ): Promise<void> {
     this.seenMessageIds.add(message.id);
-    const packet: WirePacket = {
-      kind: 'chat',
-      message,
-    };
-    const json = JSON.stringify(packet);
 
-    if (json.length <= CHUNK_SIZE_CHARS) {
+    if (!mediaBlob) {
+      const packet: WirePacket = {
+        kind: 'chat',
+        message,
+      };
       await this.dispatchWirePacket(packet, targetPeerId, true);
       return;
     }
 
-    // Split large media/image/voice/file messages into ordered 28KB chunks
-    const total = Math.ceil(json.length / CHUNK_SIZE_CHARS);
-    const transferId = `${message.id}_t`;
-    for (let i = 0; i < total; i++) {
+    // Unlimited-size chunked media streaming (works for any image, video, audio, or file)
+    const totalChunks = Math.max(1, Math.ceil(mediaBlob.size / MEDIA_CHUNK_BYTES));
+    const transferId = `tr_${message.id}`;
+
+    // Strip any inline dataUrl before wire dispatch; receiver rebuilds Blob from chunks
+    const cleanMetaMessage = {
+      ...message,
+      attachment: message.attachment
+        ? { ...message.attachment, dataUrl: undefined }
+        : undefined,
+    };
+
+    const metaPacket: WirePacket = {
+      kind: 'media-meta',
+      transferId,
+      totalChunks,
+      message: cleanMetaMessage,
+    };
+
+    await this.dispatchWirePacket(metaPacket, targetPeerId, true);
+
+    let lastPct = -1;
+    for (let i = 0; i < totalChunks; i++) {
       if (this.destroyed) return;
-      const slice = json.slice(i * CHUNK_SIZE_CHARS, (i + 1) * CHUNK_SIZE_CHARS);
-      const chunkPkt: WirePacket = {
-        kind: 'chunk',
+      const start = i * MEDIA_CHUNK_BYTES;
+      const end = Math.min(mediaBlob.size, start + MEDIA_CHUNK_BYTES);
+      const buffer = await mediaBlob.slice(start, end).arrayBuffer();
+      const b64 = uint8ToBase64(new Uint8Array(buffer));
+
+      const chunkPacket: WirePacket = {
+        kind: 'media-chunk',
         transferId,
         index: i,
-        total,
-        data: slice,
+        totalChunks,
+        data: b64,
       };
-      await this.dispatchWirePacket(chunkPkt, targetPeerId, true);
+
+      // Backpressure guard for direct WebRTC channel on very large videos/files
+      if (targetPeerId) {
+        const entry = this.rtcEntries.get(targetPeerId);
+        if (entry?.dc && entry.dc.readyState === 'open' && entry.dc.bufferedAmount > 512 * 1024) {
+          await this.waitForDcDrain(entry.dc);
+        }
+      }
+
+      await this.dispatchWirePacket(chunkPacket, targetPeerId, true);
+
+      const pct = Math.round(((i + 1) / totalChunks) * 100);
+      if (pct !== lastPct && (pct % 5 === 0 || i === totalChunks - 1)) {
+        lastPct = pct;
+        this.callbacks.onMediaTransferProgress(
+          message.id,
+          i === totalChunks - 1 ? undefined : pct,
+        );
+      }
+
+      if (i % 4 === 3) {
+        await new Promise<void>((r) => setTimeout(r, 4));
+      }
     }
   }
 
@@ -233,6 +302,29 @@ export class P2PChatEngine {
     void this.dispatchWirePacket(packet, targetPeerId, true);
   }
 
+  public sendDeleteMessage(
+    channelId: string,
+    messageId: string,
+    targetPeerId?: string,
+  ): void {
+    const packet: WirePacket = {
+      kind: 'delete-msg',
+      channelId,
+      messageId,
+      fromPeerId: this.localPeerId,
+    };
+    void this.dispatchWirePacket(packet, targetPeerId, true);
+  }
+
+  public sendClearChat(channelId: string, targetPeerId?: string): void {
+    const packet: WirePacket = {
+      kind: 'clear-chat',
+      channelId,
+      fromPeerId: this.localPeerId,
+    };
+    void this.dispatchWirePacket(packet, targetPeerId, true);
+  }
+
   public sendTyping(
     channelId: string,
     isTyping: boolean,
@@ -247,6 +339,22 @@ export class P2PChatEngine {
       timestamp: Date.now(),
     };
     void this.dispatchWirePacket(packet, targetPeerId, false);
+  }
+
+  private waitForDcDrain(dc: RTCDataChannel): Promise<void> {
+    if (dc.bufferedAmount <= 256 * 1024 || dc.readyState !== 'open') {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, 120);
+      dc.bufferedAmountLowThreshold = 128 * 1024;
+      const onLow = () => {
+        clearTimeout(timer);
+        dc.removeEventListener('bufferedamountlow', onLow);
+        resolve();
+      };
+      dc.addEventListener('bufferedamountlow', onLow);
+    });
   }
 
   private handlePageUnload = (): void => {
@@ -484,9 +592,10 @@ export class P2PChatEngine {
       }
     }
 
-    // 3. Encrypted Ephemeral Relay (retain: false -> zero data stored on relay)
+    // 3. Encrypted Ephemeral Relay (used when direct WebRTC isn't already open for target)
     if (this.client?.connected && this.aesKey) {
-      if (!isImportant && deliveredDirect && targetPeerId) return;
+      if (deliveredDirect && targetPeerId) return;
+      if (!isImportant && deliveredDirect) return;
 
       try {
         const cipher = await encryptPacket(this.aesKey, packet);
@@ -569,8 +678,43 @@ export class P2PChatEngine {
   }
 
   private handleWirePacket(pkt: WirePacket, transport: TransportKind): void {
-    if (pkt.kind === 'chunk') {
-      this.handleChunkPacket(pkt, transport);
+    if (pkt.kind === 'media-meta') {
+      const m = pkt.message;
+      if (m.senderId === this.localPeerId) return;
+      if (this.seenMessageIds.has(m.id)) return;
+      this.seenMessageIds.add(m.id);
+
+      const existing = this.peers.get(m.senderId);
+      this.upsertPeer(
+        m.senderId,
+        m.senderName,
+        transport === 'broadcast' ? true : (existing?.sameDevice ?? false),
+        existing?.webrtcState ?? 'idle',
+        existing?.dataChannelOpen ?? false,
+        Date.now(),
+      );
+
+      this.incomingTransfers.set(pkt.transferId, {
+        message: m,
+        totalChunks: pkt.totalChunks,
+        chunks: new Array<Uint8Array | undefined>(pkt.totalChunks),
+        receivedCount: 0,
+        lastProgressPct: 0,
+        createdAt: Date.now(),
+        transport,
+      });
+
+      this.callbacks.onMessageReceived({
+        ...m,
+        status: 'delivered',
+        transport,
+        transferProgress: 0,
+      });
+      return;
+    }
+
+    if (pkt.kind === 'media-chunk') {
+      void this.handleMediaChunk(pkt);
       return;
     }
 
@@ -610,6 +754,18 @@ export class P2PChatEngine {
         pkt.peerId,
         pkt.add,
       );
+      return;
+    }
+
+    if (pkt.kind === 'delete-msg') {
+      if (pkt.fromPeerId === this.localPeerId) return;
+      this.callbacks.onMessageDeleted(pkt.channelId, pkt.messageId);
+      return;
+    }
+
+    if (pkt.kind === 'clear-chat') {
+      if (pkt.fromPeerId === this.localPeerId) return;
+      this.callbacks.onChannelCleared(pkt.channelId);
       return;
     }
 
@@ -658,40 +814,46 @@ export class P2PChatEngine {
     }
   }
 
-  private handleChunkPacket(
-    pkt: Extract<WirePacket, { kind: 'chunk' }>,
-    transport: TransportKind,
-  ): void {
-    if (pkt.total <= 0 || pkt.index < 0 || pkt.index >= pkt.total) return;
+  private async handleMediaChunk(
+    pkt: Extract<WirePacket, { kind: 'media-chunk' }>,
+  ): Promise<void> {
+    const tr = this.incomingTransfers.get(pkt.transferId);
+    if (!tr || pkt.index < 0 || pkt.index >= tr.totalChunks) return;
 
-    let buf = this.chunkBuffers.get(pkt.transferId);
-    if (!buf) {
-      buf = {
-        total: pkt.total,
-        parts: new Array<string | undefined>(pkt.total),
-        received: 0,
-        createdAt: Date.now(),
-        transport,
-      };
-      this.chunkBuffers.set(pkt.transferId, buf);
+    if (tr.chunks[pkt.index] === undefined) {
+      tr.chunks[pkt.index] = base64ToUint8(pkt.data);
+      tr.receivedCount++;
     }
 
-    if (buf.parts[pkt.index] === undefined) {
-      buf.parts[pkt.index] = pkt.data;
-      buf.received++;
-    }
-
-    if (buf.received === buf.total) {
-      this.chunkBuffers.delete(pkt.transferId);
-      try {
-        const fullJson = buf.parts.join('');
-        const inner = JSON.parse(fullJson) as WirePacket;
-        if (inner.kind !== 'chunk') {
-          this.handleWirePacket(inner, buf.transport);
-        }
-      } catch {
-        // Ignore corrupted reassembly
+    const pct = Math.round((tr.receivedCount / tr.totalChunks) * 100);
+    if (pct !== tr.lastProgressPct && (pct % 5 === 0 || tr.receivedCount === tr.totalChunks)) {
+      tr.lastProgressPct = pct;
+      if (tr.receivedCount < tr.totalChunks) {
+        this.callbacks.onMediaTransferProgress(tr.message.id, pct);
       }
+    }
+
+    if (tr.receivedCount === tr.totalChunks) {
+      this.incomingTransfers.delete(pkt.transferId);
+      const mime = tr.message.attachment?.mimeType ?? 'application/octet-stream';
+      const orderedParts = tr.chunks.filter(
+        (c): c is Uint8Array => c !== undefined,
+      );
+      const blobParts = orderedParts.map((u8) => u8.buffer as ArrayBuffer);
+      const fullBlob = new Blob(blobParts, { type: mime });
+      const mediaId = tr.message.attachment?.mediaId;
+      if (mediaId) {
+        await saveMediaBlob(mediaId, fullBlob);
+      }
+      this.callbacks.onMediaTransferProgress(tr.message.id, undefined);
+
+      const ack: WirePacket = {
+        kind: 'ack',
+        messageId: tr.message.id,
+        fromPeerId: this.localPeerId,
+        channelId: tr.message.channelId,
+      };
+      void this.dispatchWirePacket(ack, tr.message.senderId, false);
     }
   }
 
@@ -957,9 +1119,9 @@ export class P2PChatEngine {
         changed = true;
       }
     }
-    for (const [tid, buf] of this.chunkBuffers.entries()) {
-      if (now - buf.createdAt > CHUNK_ASSEMBLY_TTL_MS) {
-        this.chunkBuffers.delete(tid);
+    for (const [tid, buf] of this.incomingTransfers.entries()) {
+      if (now - buf.createdAt > TRANSFER_TTL_MS) {
+        this.incomingTransfers.delete(tid);
       }
     }
     if (changed) {

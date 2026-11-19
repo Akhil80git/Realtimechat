@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
 import {
   Check,
-  Download,
   ExternalLink,
   Hash,
   Moon,
   Pencil,
+  QrCode,
+  Search,
   Sun,
   Trash2,
   User,
@@ -13,6 +14,7 @@ import {
 } from 'lucide-react';
 import { PeerInfo, StorageStats, StoredContact, UserProfile } from '../types/chat';
 import { getDmChannelId } from '../lib/crypto';
+import { formatFileSize } from '../lib/media';
 
 interface SidebarProps {
   profile: UserProfile;
@@ -28,15 +30,9 @@ interface SidebarProps {
   onCloseMobile: () => void;
   onUpdateName: (name: string) => void;
   onToggleTheme: () => void;
+  onOpenQr: () => void;
   onSelectChannel: (channelId: string) => void;
-  onExportData: () => void;
   onClearAllData: () => void;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -53,13 +49,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCloseMobile,
   onUpdateName,
   onToggleTheme,
+  onOpenQr,
   onSelectChannel,
-  onExportData,
   onClearAllData,
 }) => {
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState(profile.name);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [userSearch, setUserSearch] = useState('');
 
   const handleSaveName = (e: React.FormEvent) => {
     e.preventDefault();
@@ -72,10 +69,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
     setEditingName(false);
   };
 
+  const normalizedQuery = userSearch.trim().toLowerCase();
+
+  const filteredOnlinePeers = normalizedQuery
+    ? onlinePeers.filter((p) => p.name.toLowerCase().includes(normalizedQuery))
+    : onlinePeers;
+
   const onlineIds = new Set(onlinePeers.map((p) => p.peerId));
-  const offlineSaved = savedContacts.filter(
-    (c) => c.peerId !== profile.peerId && !onlineIds.has(c.peerId),
-  );
+  const offlineSaved = savedContacts.filter((c) => {
+    if (c.peerId === profile.peerId || onlineIds.has(c.peerId)) return false;
+    return normalizedQuery
+      ? c.name.toLowerCase().includes(normalizedQuery)
+      : true;
+  });
 
   const loungeUnread = unreadByChannel.lounge ?? 0;
 
@@ -87,6 +93,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
           Varta
         </span>
         <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={onOpenQr}
+            aria-label="Show your QR code"
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+          >
+            <QrCode className="w-3.5 h-3.5" />
+            <span>QR</span>
+          </button>
           <button
             type="button"
             onClick={onToggleTheme}
@@ -142,7 +157,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 setDraftName(profile.name);
                 setEditingName(true);
               }}
-              aria-label="Edit your display name"
+              aria-label="Edit your username"
               className="p-1.5 rounded-md text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors shrink-0"
             >
               <Pencil className="w-3.5 h-3.5" />
@@ -152,7 +167,32 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* People & Public Lounge */}
-      <div className="flex-1 overflow-y-auto px-3 py-4 space-y-6">
+      <div className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
+        {/* Username Search */}
+        <div className="px-1">
+          <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 focus-within:border-blue-600">
+            <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            <input
+              type="text"
+              value={userSearch}
+              onChange={(e) => setUserSearch(e.target.value)}
+              placeholder="Search username..."
+              aria-label="Search username"
+              className="flex-1 min-w-0 bg-transparent text-xs text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none"
+            />
+            {userSearch && (
+              <button
+                type="button"
+                onClick={() => setUserSearch('')}
+                aria-label="Clear username search"
+                className="p-0.5 text-slate-400 hover:text-slate-700 dark:hover:text-white shrink-0"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+        </div>
+
         {/* Public Group Lounge */}
         <div>
           <div className="px-2 mb-1.5 text-xs font-medium text-slate-500 dark:text-slate-400">
@@ -187,28 +227,32 @@ export const Sidebar: React.FC<SidebarProps> = ({
               People Online
             </span>
             <span className="text-xs font-mono tabular-nums text-slate-400 dark:text-slate-500">
-              {onlinePeers.length}
+              {filteredOnlinePeers.length}
             </span>
           </div>
 
-          {onlinePeers.length === 0 ? (
+          {filteredOnlinePeers.length === 0 ? (
             <div className="px-2.5 py-2 space-y-2">
               <p className="text-xs text-slate-400 dark:text-slate-500 leading-relaxed">
-                No one else is online right now. Anyone who opens this site and enters their name will appear here automatically.
+                {normalizedQuery
+                  ? `No online user matched "${userSearch}".`
+                  : 'Share your QR code or site link. Anyone who opens it appears here automatically.'}
               </p>
-              <a
-                href={secondTabUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                <span>Open 2nd account tab</span>
-              </a>
+              {!normalizedQuery && (
+                <a
+                  href={secondTabUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open 2nd account tab</span>
+                </a>
+              )}
             </div>
           ) : (
             <div className="space-y-1">
-              {onlinePeers.map((peer) => {
+              {filteredOnlinePeers.map((peer) => {
                 const dmId = getDmChannelId(profile.peerId, peer.peerId);
                 const isSelected = activeChannelId === dmId;
                 const unread = unreadByChannel[dmId] ?? 0;
@@ -303,48 +347,45 @@ export const Sidebar: React.FC<SidebarProps> = ({
         )}
       </div>
 
-      {/* LocalStorage Vault Footer */}
+      {/* Private Site Storage Footer (Delete-Only, No Export) */}
       <div className="px-4 py-3 border-t border-slate-200 dark:border-slate-800 space-y-2.5 bg-slate-50/70 dark:bg-slate-900">
         <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-          <span>Local Storage</span>
+          <span>In-Site Storage</span>
           <span className="font-mono tabular-nums">
-            {storageStats.messageCount} msgs · {formatBytes(storageStats.totalBytes)}
+            {storageStats.messageCount} msgs · {formatFileSize(storageStats.totalBytes)}
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onExportData}
-            className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
-          >
-            <Download className="w-3.5 h-3.5" />
-            <span>Export</span>
-          </button>
-
-          {confirmClearAll ? (
+        {confirmClearAll ? (
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setConfirmClearAll(false)}
+              className="flex-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs font-medium text-slate-700 dark:text-slate-300"
+            >
+              Cancel
+            </button>
             <button
               type="button"
               onClick={() => {
                 setConfirmClearAll(false);
                 onClearAllData();
               }}
-              onMouseLeave={() => setConfirmClearAll(false)}
-              className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-xs font-medium text-white transition-colors whitespace-nowrap"
+              className="flex-1 px-2.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-xs font-medium text-white transition-colors whitespace-nowrap"
             >
-              <span>Confirm Wipe</span>
+              Confirm Delete
             </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => setConfirmClearAll(true)}
-              className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors whitespace-nowrap"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>Log Out</span>
-            </button>
-          )}
-        </div>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setConfirmClearAll(true)}
+            className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors whitespace-nowrap"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Delete All Site Data</span>
+          </button>
+        )}
       </div>
     </aside>
   );

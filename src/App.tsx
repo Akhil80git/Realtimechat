@@ -1,14 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CameraModal } from './components/CameraModal';
 import { ChatArea } from './components/ChatArea';
-import { OnboardingView } from './components/OnboardingView';
+import { QrModal } from './components/QrModal';
 import { Sidebar } from './components/Sidebar';
-import { generatePeerId, getDmChannelId } from './lib/crypto';
+import {
+  generatePeerId,
+  generateQrDerivedUsername,
+  generateRandomUsername,
+  getDmChannelId,
+} from './lib/crypto';
+import { prepareMediaAttachment } from './lib/media';
 import { P2PChatEngine } from './lib/p2pEngine';
 import {
   clearAllLocalData,
   clearChannelMessages,
-  exportAllLocalData,
-  getStorageStats,
+  deleteSingleMessage,
+  getStorageStatsAsync,
   loadAllMessages,
   loadContacts,
   loadProfile,
@@ -26,9 +33,18 @@ import {
   UserProfile,
 } from './types/chat';
 
-function isNewTabAccountMode(): boolean {
+interface UrlBootParams {
+  isNewTab: boolean;
+  connectPeerId: string | null;
+  connectFromName: string | null;
+}
+
+function parseUrlBootParams(): UrlBootParams {
   const params = new URLSearchParams(window.location.search);
-  return params.get('as') === 'new';
+  const isNewTab = params.get('as') === 'new';
+  const connectPeerId = params.get('connect')?.trim() || null;
+  const connectFromName = params.get('from')?.trim() || null;
+  return { isNewTab, connectPeerId, connectFromName };
 }
 
 function loadSessionProfileOverride(): UserProfile | null {
@@ -78,37 +94,80 @@ function applyReactionUpdate(
   return changed ? next : list;
 }
 
+function resolveBootState(boot: UrlBootParams): {
+  profile: UserProfile;
+  initialChannelId: string;
+} {
+  const preferredTheme: 'light' | 'dark' = window.matchMedia?.(
+    '(prefers-color-scheme: dark)',
+  ).matches
+    ? 'dark'
+    : 'light';
+
+  let profile = loadSessionProfileOverride();
+  if (!profile && !boot.isNewTab) {
+    profile = loadProfile();
+  }
+
+  // Instant auto-account creation on first visit (or via QR scan)
+  if (!profile) {
+    const autoName =
+      boot.connectPeerId && boot.connectFromName
+        ? generateQrDerivedUsername(boot.connectFromName)
+        : generateRandomUsername();
+
+    profile = {
+      peerId: generatePeerId(),
+      name: autoName,
+      theme: preferredTheme,
+      createdAt: Date.now(),
+    };
+
+    if (boot.isNewTab) {
+      saveSessionProfileOverride(profile);
+    } else {
+      saveProfile(profile);
+    }
+  }
+
+  let initialChannelId = 'lounge';
+  if (boot.connectPeerId && boot.connectPeerId !== profile.peerId) {
+    upsertContact(
+      boot.connectPeerId,
+      boot.connectFromName || 'Friend',
+      Date.now(),
+    );
+    initialChannelId = getDmChannelId(profile.peerId, boot.connectPeerId);
+  }
+
+  return { profile, initialChannelId };
+}
+
 export default function App() {
-  const newTabMode = useMemo(() => isNewTabAccountMode(), []);
+  const bootParams = useMemo(() => parseUrlBootParams(), []);
+  const bootState = useMemo(() => resolveBootState(bootParams), [bootParams]);
 
-  const [profile, setProfile] = useState<UserProfile | null>(() => {
-    const sessionOverride = loadSessionProfileOverride();
-    if (sessionOverride) return sessionOverride;
-    if (newTabMode) return null;
-    return loadProfile();
-  });
-
-  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
-    const existing = loadSessionProfileOverride() ?? loadProfile();
-    if (existing?.theme) return existing.theme;
-    return window.matchMedia?.('(prefers-color-scheme: dark)').matches
-      ? 'dark'
-      : 'light';
-  });
-
-  const [activeChannelId, setActiveChannelId] = useState<string>('lounge');
+  const [profile, setProfile] = useState<UserProfile>(bootState.profile);
+  const [theme, setTheme] = useState<'light' | 'dark'>(bootState.profile.theme);
+  const [activeChannelId, setActiveChannelId] = useState<string>(
+    bootState.initialChannelId,
+  );
   const [messages, setMessages] = useState<ChatMessage[]>(() => loadAllMessages());
   const [onlinePeers, setOnlinePeers] = useState<PeerInfo[]>([]);
   const [savedContacts, setSavedContacts] = useState<StoredContact[]>(() =>
     loadContacts(),
   );
   const [unreadByChannel, setUnreadByChannel] = useState<Record<string, number>>({});
-  const [storageStats, setStorageStats] = useState<StorageStats>(() =>
-    getStorageStats(),
-  );
+  const [storageStats, setStorageStats] = useState<StorageStats>({
+    totalBytes: 0,
+    messageCount: 0,
+    contactCount: 0,
+  });
   const [meshConnected, setMeshConnected] = useState<boolean>(false);
   const [meshLabel, setMeshLabel] = useState<string>('Connecting...');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState<boolean>(false);
+  const [qrModalOpen, setQrModalOpen] = useState<boolean>(false);
+  const [cameraModalOpen, setCameraModalOpen] = useState<boolean>(false);
 
   const engineRef = useRef<P2PChatEngine | null>(null);
   const messagesRef = useRef<ChatMessage[]>(messages);
@@ -116,6 +175,16 @@ export default function App() {
 
   const activeChannelRef = useRef<string>(activeChannelId);
   activeChannelRef.current = activeChannelId;
+
+  // Clean QR query params from URL bar after boot so reload stays tidy
+  useEffect(() => {
+    if (bootParams.connectPeerId || bootParams.connectFromName) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('connect');
+      url.searchParams.delete('from');
+      window.history.replaceState({}, '', url.toString());
+    }
+  }, [bootParams.connectPeerId, bootParams.connectFromName]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -127,12 +196,12 @@ export default function App() {
   }, [theme]);
 
   const refreshStats = useCallback(() => {
-    setStorageStats(getStorageStats());
+    void getStorageStatsAsync().then((stats) => {
+      setStorageStats(stats);
+    });
   }, []);
 
   useEffect(() => {
-    if (!profile) return;
-
     const currentMsgs = loadAllMessages();
     setMessages(currentMsgs);
     refreshStats();
@@ -177,6 +246,16 @@ export default function App() {
 
         refreshStats();
       },
+      onMediaTransferProgress: (messageId, progress) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === messageId ? { ...m, transferProgress: progress } : m,
+          ),
+        );
+        if (progress === undefined) {
+          refreshStats();
+        }
+      },
       onMessageAcked: (messageId) => {
         setMessages((prev) => {
           let changed = false;
@@ -202,6 +281,18 @@ export default function App() {
           return next;
         });
       },
+      onMessageDeleted: (_channelId, messageId) => {
+        void deleteSingleMessage(messageId).then((remaining) => {
+          setMessages(remaining);
+          refreshStats();
+        });
+      },
+      onChannelCleared: (channelId) => {
+        void clearChannelMessages(channelId).then((remaining) => {
+          setMessages(remaining);
+          refreshStats();
+        });
+      },
       onConnectionStatusChange: (connected, label) => {
         setMeshConnected(connected);
         setMeshLabel(label);
@@ -215,55 +306,34 @@ export default function App() {
       engine.stop();
       engineRef.current = null;
     };
-  }, [profile?.peerId, refreshStats]);
+  }, [profile.peerId, refreshStats]);
 
   useEffect(() => {
-    if (profile && engineRef.current) {
+    if (engineRef.current) {
       engineRef.current.updateLocalName(profile.name);
     }
-  }, [profile?.name]);
+  }, [profile.name]);
 
-  const handleToggleTheme = () => {
-    const nextTheme = theme === 'dark' ? 'light' : 'dark';
-    setTheme(nextTheme);
-    if (profile) {
-      const updated: UserProfile = { ...profile, theme: nextTheme };
+  const persistProfile = useCallback(
+    (updated: UserProfile) => {
       setProfile(updated);
-      if (newTabMode || loadSessionProfileOverride()) {
+      if (bootParams.isNewTab || loadSessionProfileOverride()) {
         saveSessionProfileOverride(updated);
       } else {
         saveProfile(updated);
       }
-    }
-  };
+    },
+    [bootParams.isNewTab],
+  );
 
-  const handleCompleteOnboarding = (name: string) => {
-    const newProfile: UserProfile = {
-      peerId: generatePeerId(),
-      name,
-      theme,
-      createdAt: Date.now(),
-    };
-
-    if (newTabMode) {
-      saveSessionProfileOverride(newProfile);
-    } else {
-      saveProfile(newProfile);
-    }
-
-    setActiveChannelId('lounge');
-    setProfile(newProfile);
+  const handleToggleTheme = () => {
+    const nextTheme = theme === 'dark' ? 'light' : 'dark';
+    setTheme(nextTheme);
+    persistProfile({ ...profile, theme: nextTheme });
   };
 
   const handleUpdateName = (name: string) => {
-    if (!profile) return;
-    const updated: UserProfile = { ...profile, name };
-    setProfile(updated);
-    if (newTabMode || loadSessionProfileOverride()) {
-      saveSessionProfileOverride(updated);
-    } else {
-      saveProfile(updated);
-    }
+    persistProfile({ ...profile, name });
   };
 
   const handleSelectChannel = (channelId: string) => {
@@ -277,22 +347,22 @@ export default function App() {
   };
 
   const targetPeer = useMemo(() => {
-    if (!profile || activeChannelId === 'lounge') return null;
+    if (activeChannelId === 'lounge') return null;
     return (
       onlinePeers.find(
         (p) => getDmChannelId(profile.peerId, p.peerId) === activeChannelId,
       ) ?? null
     );
-  }, [activeChannelId, onlinePeers, profile]);
+  }, [activeChannelId, onlinePeers, profile.peerId]);
 
   const targetSavedContact = useMemo(() => {
-    if (!profile || activeChannelId === 'lounge') return null;
+    if (activeChannelId === 'lounge') return null;
     return (
       savedContacts.find(
         (c) => getDmChannelId(profile.peerId, c.peerId) === activeChannelId,
       ) ?? null
     );
-  }, [activeChannelId, profile, savedContacts]);
+  }, [activeChannelId, profile.peerId, savedContacts]);
 
   const channelTitle = useMemo(() => {
     if (activeChannelId === 'lounge') return 'Everyone Online';
@@ -304,9 +374,9 @@ export default function App() {
   const handleSendMessage = (
     text: string,
     attachment?: ChatAttachment,
+    mediaBlob?: Blob,
     replyTo?: ReplyRef,
   ) => {
-    if (!profile) return;
     const msgId = `${profile.peerId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const now = Date.now();
     const recipientId = targetPeer?.peerId ?? targetSavedContact?.peerId;
@@ -323,6 +393,7 @@ export default function App() {
       timestamp: now,
       status: 'sent',
       transport: targetPeer?.dataChannelOpen ? 'webrtc' : 'local',
+      transferProgress: mediaBlob ? 0 : undefined,
     };
 
     const nextMessages = [...messagesRef.current, outbound];
@@ -353,12 +424,18 @@ export default function App() {
         replyTo: outbound.replyTo,
         timestamp: outbound.timestamp,
       },
+      mediaBlob,
       recipientId,
     );
   };
 
+  const handleCameraCaptured = (blob: Blob, name: string) => {
+    void prepareMediaAttachment(blob, name).then(({ attachment }) => {
+      handleSendMessage('', attachment, blob);
+    });
+  };
+
   const handleToggleReaction = (messageId: string, emoji: string) => {
-    if (!profile) return;
     const targetMsg = messagesRef.current.find((m) => m.id === messageId);
     if (!targetMsg) return;
 
@@ -392,64 +469,62 @@ export default function App() {
     engineRef.current?.sendTyping(activeChannelId, isTyping, recipientId);
   };
 
-  const handleClearChannel = () => {
-    const remaining = clearChannelMessages(activeChannelId);
-    setMessages(remaining);
-    refreshStats();
+  const handleDeleteMessage = (messageId: string) => {
+    void deleteSingleMessage(messageId).then((remaining) => {
+      setMessages(remaining);
+      refreshStats();
+    });
+    const recipientId = targetPeer?.peerId ?? targetSavedContact?.peerId;
+    engineRef.current?.sendDeleteMessage(activeChannelId, messageId, recipientId);
   };
 
-  const handleExportData = () => {
-    const json = exportAllLocalData();
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `varta-local-chats-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleClearChannel = () => {
+    void clearChannelMessages(activeChannelId).then((remaining) => {
+      setMessages(remaining);
+      refreshStats();
+    });
+    const recipientId = targetPeer?.peerId ?? targetSavedContact?.peerId;
+    engineRef.current?.sendClearChat(activeChannelId, recipientId);
   };
 
   const handleClearAllData = () => {
     engineRef.current?.stop();
-    if (!newTabMode) {
-      clearAllLocalData();
-    }
-    try {
-      sessionStorage.removeItem('varta_session_account_v2');
-    } catch {
-      // Ignore
-    }
-    setMessages(newTabMode ? loadAllMessages() : []);
-    setSavedContacts(newTabMode ? loadContacts() : []);
-    setOnlinePeers([]);
-    setUnreadByChannel({});
-    setProfile(null);
-    refreshStats();
+    const resetTask = bootParams.isNewTab
+      ? Promise.resolve()
+      : clearAllLocalData();
+
+    void resetTask.then(() => {
+      try {
+        sessionStorage.removeItem('varta_session_account_v2');
+      } catch {
+        // Ignore
+      }
+      const freshProfile: UserProfile = {
+        peerId: generatePeerId(),
+        name: generateRandomUsername(),
+        theme,
+        createdAt: Date.now(),
+      };
+      if (bootParams.isNewTab) {
+        saveSessionProfileOverride(freshProfile);
+      } else {
+        saveProfile(freshProfile);
+      }
+      setMessages(bootParams.isNewTab ? loadAllMessages() : []);
+      setSavedContacts(bootParams.isNewTab ? loadContacts() : []);
+      setOnlinePeers([]);
+      setUnreadByChannel({});
+      setActiveChannelId('lounge');
+      setProfile(freshProfile);
+      refreshStats();
+    });
   };
 
-  const shareUrl = useMemo(() => {
-    const url = new URL(window.location.href);
-    url.searchParams.delete('as');
-    url.searchParams.delete('room');
-    return url.toString();
-  }, []);
-
   const secondTabUrl = useMemo(() => {
-    const url = new URL(window.location.href);
-    url.searchParams.delete('room');
+    const url = new URL(window.location.origin + window.location.pathname);
     url.searchParams.set('as', 'new');
     return url.toString();
   }, []);
-
-  if (!profile) {
-    return (
-      <OnboardingView
-        theme={theme}
-        onToggleTheme={handleToggleTheme}
-        onComplete={handleCompleteOnboarding}
-      />
-    );
-  }
 
   return (
     <div className="h-screen w-screen overflow-hidden flex bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
@@ -467,8 +542,8 @@ export default function App() {
         onCloseMobile={() => setMobileSidebarOpen(false)}
         onUpdateName={handleUpdateName}
         onToggleTheme={handleToggleTheme}
+        onOpenQr={() => setQrModalOpen(true)}
         onSelectChannel={handleSelectChannel}
-        onExportData={handleExportData}
         onClearAllData={handleClearAllData}
       />
 
@@ -480,14 +555,29 @@ export default function App() {
         targetPeer={targetPeer}
         onlinePeers={onlinePeers}
         messages={messages}
-        shareUrl={shareUrl}
         secondTabUrl={secondTabUrl}
         onOpenMobileSidebar={() => setMobileSidebarOpen(true)}
+        onOpenQr={() => setQrModalOpen(true)}
+        onOpenCamera={() => setCameraModalOpen(true)}
         onSelectChannel={handleSelectChannel}
         onSendMessage={handleSendMessage}
         onToggleReaction={handleToggleReaction}
+        onDeleteMessage={handleDeleteMessage}
         onTypingChange={handleTypingChange}
         onClearChannel={handleClearChannel}
+      />
+
+      <QrModal
+        isOpen={qrModalOpen}
+        peerId={profile.peerId}
+        userName={profile.name}
+        onClose={() => setQrModalOpen(false)}
+      />
+
+      <CameraModal
+        isOpen={cameraModalOpen}
+        onClose={() => setCameraModalOpen(false)}
+        onCaptured={handleCameraCaptured}
       />
     </div>
   );

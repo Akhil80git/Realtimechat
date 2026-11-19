@@ -1,9 +1,14 @@
 import { ChatMessage, StorageStats, StoredContact, UserProfile } from '../types/chat';
+import {
+  clearAllMediaBlobs,
+  deleteMediaBlobs,
+  getMediaVaultBytes,
+} from './mediaVault';
 
 const PROFILE_KEY = 'varta_account_v2';
 const CONTACTS_KEY = 'varta_contacts_v2';
 const MSG_KEY = 'varta_messages_v2';
-const MAX_MESSAGES = 1500;
+const MAX_MESSAGES = 2000;
 
 function safeParse<T>(raw: string | null, fallback: T): T {
   if (!raw) return fallback;
@@ -19,21 +24,10 @@ function safeSet(key: string, value: unknown): void {
     localStorage.setItem(key, JSON.stringify(value));
   } catch {
     try {
-      // First free space by stripping oldest media payloads while keeping text messages intact
       const msgs = safeParse<ChatMessage[]>(localStorage.getItem(MSG_KEY), []);
-      let freed = 0;
-      const compacted = msgs.map((m) => {
-        if (m.attachment && freed < 15) {
-          freed++;
-          const { attachment, ...rest } = m;
-          return {
-            ...rest,
-            text: rest.text || `[${attachment.kind}: ${attachment.name}]`,
-          };
-        }
-        return m;
-      });
-      localStorage.setItem(MSG_KEY, JSON.stringify(compacted.slice(-400)));
+      if (msgs.length > 300) {
+        localStorage.setItem(MSG_KEY, JSON.stringify(msgs.slice(-300)));
+      }
       localStorage.setItem(key, JSON.stringify(value));
     } catch {
       // Ignore if browser storage is full
@@ -59,9 +53,26 @@ export function saveAllMessages(messages: ChatMessage[]): void {
   safeSet(MSG_KEY, trimmed);
 }
 
-export function clearChannelMessages(channelId: string): ChatMessage[] {
-  const remaining = loadAllMessages().filter((m) => m.channelId !== channelId);
+export async function deleteSingleMessage(messageId: string): Promise<ChatMessage[]> {
+  const all = loadAllMessages();
+  const target = all.find((m) => m.id === messageId);
+  const remaining = all.filter((m) => m.id !== messageId);
   saveAllMessages(remaining);
+  if (target?.attachment?.mediaId) {
+    await deleteMediaBlobs([target.attachment.mediaId]);
+  }
+  return remaining;
+}
+
+export async function clearChannelMessages(channelId: string): Promise<ChatMessage[]> {
+  const all = loadAllMessages();
+  const removedMediaIds = all
+    .filter((m) => m.channelId === channelId && m.attachment?.mediaId)
+    .map((m) => m.attachment!.mediaId);
+
+  const remaining = all.filter((m) => m.channelId !== channelId);
+  saveAllMessages(remaining);
+  await deleteMediaBlobs(removedMediaIds);
   return remaining;
 }
 
@@ -103,36 +114,25 @@ export function upsertContact(
   return sorted;
 }
 
-export function getStorageStats(): StorageStats {
-  let totalBytes = 0;
+export async function getStorageStatsAsync(): Promise<StorageStats> {
+  let localBytes = 0;
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
     if (!key || !key.startsWith('varta_')) continue;
     const val = localStorage.getItem(key) ?? '';
-    totalBytes += new Blob([key, val]).size;
+    localBytes += new Blob([key, val]).size;
   }
 
+  const mediaBytes = await getMediaVaultBytes();
+
   return {
-    totalBytes,
+    totalBytes: localBytes + mediaBytes,
     messageCount: loadAllMessages().length,
     contactCount: loadContacts().length,
   };
 }
 
-export function exportAllLocalData(): string {
-  return JSON.stringify(
-    {
-      exportedAt: new Date().toISOString(),
-      account: loadProfile(),
-      contacts: loadContacts(),
-      messages: loadAllMessages(),
-    },
-    null,
-    2,
-  );
-}
-
-export function clearAllLocalData(): void {
+export async function clearAllLocalData(): Promise<void> {
   const toDelete: string[] = [];
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
@@ -141,4 +141,5 @@ export function clearAllLocalData(): void {
     }
   }
   toDelete.forEach((k) => localStorage.removeItem(k));
+  await clearAllMediaBlobs();
 }
